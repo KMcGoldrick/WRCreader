@@ -24,6 +24,7 @@ Usage:
 
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
+import tkinter.scrolledtext as scrolledtext
 import threading
 import queue
 import struct
@@ -43,6 +44,7 @@ WINDOW      = 200       # samples shown in scrolling plot
 BAUDRATE    = 115200
 INTERVAL    = 50        # animation refresh ms
 TCM_BIN_SOF = 0xAA
+RAW_WIN_MAX_LINES = 2000
 
 # ── Case metadata ──────────────────────────────────────────────────────────────
 #
@@ -196,6 +198,7 @@ class SerialReader(threading.Thread):
       ("DATA",   case_id, values, fmt)   -- values already parsed for binary
       ("STATUS", message)
       ("ERROR",  message)
+      ("RAW",    raw_string)             -- new: exact raw representation for UI
     """
     def __init__(self, port, baud, q: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -231,12 +234,23 @@ class SerialReader(threading.Thread):
                         if detector.format == "binary":
                             bin_reader.push(byte)
                             for cid, payload in bin_reader.pop_frames():
+                                # publish a RAW representation for the UI (hex payload)
+                                try:
+                                    raw_str = f"BIN,{cid},{payload.hex()}"
+                                    self.q.put(("RAW", raw_str))
+                                except Exception:
+                                    pass
                                 self._dispatch_binary(cid, payload)
                         else:
                             text_buf.append(byte)
                             if byte == ord('\n'):
                                 line = text_buf.decode("ascii", errors="replace")
                                 text_buf.clear()
+                                # publish raw text line for UI
+                                try:
+                                    self.q.put(("RAW", line))
+                                except Exception:
+                                    pass
                                 result = parse_text_line(line)
                                 if result:
                                     cid, values = result
@@ -284,6 +298,11 @@ class TCMPlotter(tk.Tk):
         self.lines         = []
         self.canvas_widget = None
         self.running       = False
+
+        # Raw window state
+        self.raw_win   = None
+        self.raw_text  = None
+        self.raw_autoscroll = tk.BooleanVar(value=True)
 
         self._build_controls()
         self._refresh_ports()
@@ -349,6 +368,7 @@ class TCMPlotter(tk.Tk):
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(btn_frame, text="Save PNG...",
                    command=self._save_png).pack(side=tk.LEFT)
+        ttk.Button(btn_frame, text="Raw...", command=self._open_raw_window).pack(side=tk.LEFT, padx=(6,0))
 
         # Status bar
         ttk.Label(self, textvariable=self.status_var,
@@ -387,6 +407,69 @@ class TCMPlotter(tk.Tk):
         )
         if path:
             self.file_path.set(path)
+
+    # ── Raw window ────────────────────────────────────────────────────────────
+    def _open_raw_window(self):
+        if self.raw_win and tk.Toplevel.winfo_exists(self.raw_win):
+            self.raw_win.lift()
+            return
+
+        self.raw_win = tk.Toplevel(self)
+        self.raw_win.title("Raw Data")
+        self.raw_win.protocol("WM_DELETE_WINDOW", self._close_raw_window)
+        frm = ttk.Frame(self.raw_win, padding=6)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        top_row = ttk.Frame(frm)
+        top_row.pack(fill=tk.X, pady=(0,6))
+        ttk.Checkbutton(top_row, text="Autoscroll", variable=self.raw_autoscroll).pack(side=tk.LEFT)
+
+        clear_btn = ttk.Button(top_row, text="Clear", command=self._clear_raw)
+        clear_btn.pack(side=tk.RIGHT)
+
+        self.raw_text = scrolledtext.ScrolledText(frm, wrap=tk.NONE, state=tk.DISABLED, height=20)
+        try:
+            self.raw_text.configure(background="#0f0f0f", foreground="#e6e6e6", insertbackground="#e6e6e6")
+        except Exception:
+            pass
+        self.raw_text.pack(fill=tk.BOTH, expand=True)
+
+    def _close_raw_window(self):
+        if self.raw_win:
+            try:
+                self.raw_win.destroy()
+            except Exception:
+                pass
+        self.raw_win = None
+        self.raw_text = None
+
+    def _clear_raw(self):
+        if not self.raw_text:
+            return
+        try:
+            self.raw_text.configure(state=tk.NORMAL)
+            self.raw_text.delete("1.0", tk.END)
+        finally:
+            self.raw_text.configure(state=tk.DISABLED)
+
+    def _append_raw_line(self, line: str):
+        if not self.raw_text:
+            return
+        try:
+            self.raw_text.configure(state=tk.NORMAL)
+            self.raw_text.insert(tk.END, line if line.endswith("\n") else line + "\n")
+            # trim old lines if necessary
+            try:
+                total_lines = int(self.raw_text.index("end-1c").split(".")[0])
+                if total_lines > RAW_WIN_MAX_LINES:
+                    delete_to = total_lines - RAW_WIN_MAX_LINES
+                    self.raw_text.delete("1.0", f"{delete_to}.0")
+            except Exception:
+                pass
+            if self.raw_autoscroll.get():
+                self.raw_text.see(tk.END)
+        finally:
+            self.raw_text.configure(state=tk.DISABLED)
 
     # ── Plot builder ───────────────────────────────────────────────────────────
     def _rebuild_plot(self):
@@ -432,9 +515,10 @@ class TCMPlotter(tk.Tk):
         self.canvas_widget = canvas
 
         if self.source_var.get() == "serial":
+            # use blit=False to avoid backend resize issues in some environments
             self.anim = animation.FuncAnimation(
                 self.fig, self._animate, interval=INTERVAL,
-                blit=True, cache_frame_data=False
+                blit=False, cache_frame_data=False
             )
             canvas.draw()
 
@@ -459,6 +543,10 @@ class TCMPlotter(tk.Tk):
                     self.format_var.set("BINARY")
                 elif "TEXT" in msg.upper():
                     self.format_var.set("TEXT")
+                continue
+
+            if item[0] == "RAW":
+                self._append_raw_line(item[1])
                 continue
 
             # ("DATA", cid, values, fmt)
@@ -627,10 +715,11 @@ class TCMPlotter(tk.Tk):
 
     def _on_close(self):
         self._stop()
+        self._close_raw_window()
         self.destroy()
 
 
-# ── Entry point ────────────────────────────────────────────────────────────────
+# ── Entry point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = TCMPlotter()
     app.mainloop()
