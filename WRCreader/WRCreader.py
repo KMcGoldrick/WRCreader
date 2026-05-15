@@ -198,7 +198,8 @@ class SerialReader(threading.Thread):
       ("DATA",   case_id, values, fmt)   -- values already parsed for binary
       ("STATUS", message)
       ("ERROR",  message)
-      ("RAW",    raw_string)             -- new: exact raw representation for UI
+      ("RAW",    raw_string)             -- exact raw representation for UI
+    Also supports thread-safe writes via write()/write_text().
     """
     def __init__(self, port, baud, q: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
@@ -206,10 +207,14 @@ class SerialReader(threading.Thread):
         self.baud       = baud
         self.q          = q
         self.stop_event = stop_event
+        self.ser        = None
+        self._write_lock = threading.Lock()
 
     def run(self):
         try:
             with serial.Serial(self.port, self.baud, timeout=1) as ser:
+                # keep reference so UI can write
+                self.ser = ser
                 detector   = FormatDetector()
                 bin_reader = BinaryFrameReader()
                 text_buf   = bytearray()
@@ -258,6 +263,12 @@ class SerialReader(threading.Thread):
 
         except serial.SerialException as e:
             self.q.put(("ERROR", str(e)))
+        finally:
+            # clear serial reference
+            try:
+                self.ser = None
+            except Exception:
+                pass
 
     def _dispatch_binary(self, cid, payload):
         if cid in NON_PLOT_CASES:
@@ -270,6 +281,28 @@ class SerialReader(threading.Thread):
             self.q.put(("DATA", cid, values, "binary"))
         except struct.error:
             pass    # malformed payload, skip silently
+
+    def write(self, data: bytes) -> bool:
+        """Thread-safe write of raw bytes to the open serial port. Returns True on success."""
+        try:
+            with self._write_lock:
+                if self.ser and getattr(self.ser, "is_open", False):
+                    self.ser.write(data)
+                    return True
+        except Exception as e:
+            try:
+                self.q.put(("ERROR", f"Write failed: {e}"))
+            except Exception:
+                pass
+        return False
+
+    def write_text(self, text: str, encoding="ascii") -> bool:
+        """Encode text and write; helper used by UI."""
+        try:
+            data = text.encode(encoding, errors="replace")
+            return self.write(data)
+        except Exception:
+            return False
 
 
 # ── Main application ───────────────────────────────────────────────────────────
@@ -303,6 +336,11 @@ class TCMPlotter(tk.Tk):
         self.raw_win   = None
         self.raw_text  = None
         self.raw_autoscroll = tk.BooleanVar(value=True)
+
+        # Send window state
+        self.send_win   = None
+        self.send_entry = None
+        self.append_nl  = tk.BooleanVar(value=True)
 
         self._build_controls()
         self._refresh_ports()
@@ -369,6 +407,7 @@ class TCMPlotter(tk.Tk):
         ttk.Button(btn_frame, text="Save PNG...",
                    command=self._save_png).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Raw...", command=self._open_raw_window).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(btn_frame, text="Send...", command=self._open_send_window).pack(side=tk.LEFT, padx=(6,0))
 
         # Status bar
         ttk.Label(self, textvariable=self.status_var,
@@ -470,6 +509,61 @@ class TCMPlotter(tk.Tk):
                 self.raw_text.see(tk.END)
         finally:
             self.raw_text.configure(state=tk.DISABLED)
+
+    # ── Send window ───────────────────────────────────────────────────────────
+    def _open_send_window(self):
+        if self.send_win and tk.Toplevel.winfo_exists(self.send_win):
+            self.send_win.lift()
+            return
+
+        self.send_win = tk.Toplevel(self)
+        self.send_win.title("Send Text")
+        self.send_win.transient(self)
+        frm = ttk.Frame(self.send_win, padding=6)
+        frm.pack(fill=tk.BOTH, expand=True)
+
+        ttk.Label(frm, text="Text:").grid(row=0, column=0, sticky=tk.W)
+        self.send_entry = ttk.Entry(frm, width=50)
+        self.send_entry.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+        self.send_entry.focus_set()
+
+        ttk.Checkbutton(frm, text="Append newline", variable=self.append_nl).grid(row=1, column=1, sticky=tk.W, pady=(6,0))
+
+        btn_row = ttk.Frame(frm)
+        btn_row.grid(row=2, column=0, columnspan=2, pady=(8,0), sticky=tk.E)
+        ttk.Button(btn_row, text="Send", command=self._on_send_clicked).pack(side=tk.LEFT, padx=(0,6))
+        ttk.Button(btn_row, text="Close", command=self._close_send_window).pack(side=tk.LEFT)
+
+        self.send_entry.bind("<Return>", lambda e: self._on_send_clicked())
+
+    def _close_send_window(self):
+        if self.send_win:
+            try:
+                self.send_win.destroy()
+            except Exception:
+                pass
+        self.send_win = None
+        self.send_entry = None
+
+    def _on_send_clicked(self):
+        text = (self.send_entry.get() if self.send_entry else "")
+        if self.append_nl.get():
+            text = text + "\n"
+        self._send_text_to_device(text)
+
+    def _send_text_to_device(self, text: str):
+        if self.source_var.get() != "serial":
+            messagebox.showerror("Not serial", "Switch to Serial source to send text.")
+            return
+        if not self.serial_thread:
+            messagebox.showerror("No serial", "Start a serial session first.")
+            return
+        ok = self.serial_thread.write_text(text)
+        if ok:
+            disp = text if len(text) <= 80 else (text[:77] + "...")
+            self.status_var.set(f"Sent → {disp!r}")
+        else:
+            messagebox.showerror("Send failed", "Could not write to serial port. See status for details.")
 
     # ── Plot builder ───────────────────────────────────────────────────────────
     def _rebuild_plot(self):
@@ -716,6 +810,7 @@ class TCMPlotter(tk.Tk):
     def _on_close(self):
         self._stop()
         self._close_raw_window()
+        self._close_send_window()
         self.destroy()
 
 
