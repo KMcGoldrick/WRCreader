@@ -2,7 +2,7 @@
 tcm_plotter.py
 --------------
 Reads and plots TCM sensor data from either a live serial (RS-485/UART)
-port or a CSV log file.
+port or a log file.
 
 Auto-detects frame format:
   Binary: 0xAA | case (1 byte) | length (1 byte) | payload (raw bytes)
@@ -17,6 +17,13 @@ Supported cases (plottable)
 
 Cases 6-11 are calibration/config: logged to status bar, not plotted.
 
+Auto-save: when started in serial mode a log file is created automatically
+in the same directory as this script, named:
+  tcm_YYYYMMDD_HHMMSS.csv   (text mode)
+  tcm_YYYYMMDD_HHMMSS.bin   (binary mode)
+The file format is determined by the detected stream format and matches
+what "Read From Log File" can read back.
+
 Usage:
   pip install pyserial matplotlib
   python tcm_plotter.py
@@ -29,6 +36,7 @@ import threading
 import queue
 import struct
 import os
+import datetime
 
 import serial
 import serial.tools.list_ports
@@ -40,25 +48,14 @@ from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
 from collections import deque
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-WINDOW      = 200       # samples shown in scrolling plot
-BAUDRATE    = 115200
-INTERVAL    = 50        # animation refresh ms
-TCM_BIN_SOF = 0xAA
+WINDOW           = 200
+BAUDRATE         = 115200
+INTERVAL         = 50           # animation refresh ms
+TCM_BIN_SOF      = 0xAA
 RAW_WIN_MAX_LINES = 2000
+LOG_DIR          = os.path.dirname(os.path.abspath(__file__))
 
 # ── Case metadata ──────────────────────────────────────────────────────────────
-#
-# parse_text(values: list[str]) -> list[number]
-# parse_bin(payload: bytes)     -> list[number]
-#
-# Binary payload layouts (little-endian, matching tcmDataBinary):
-#   case 1: fff           (headingDeg, north, east)
-#   case 2: fff           (rollRad, pitchRad, yawRad)
-#   case 3: hhh fff       (raw x/y/z int16, scaled x/y/z float)
-#   case 4: hhh fff       (raw x/y/z int16, scaled x/y/z float)
-#   case 5: HfHf          (raw temp uint16, scaled temp float,
-#                          raw batt uint16, scaled batt float)
-
 CASES = {
     1: {
         "label":      "1 - Heading + Velocity",
@@ -102,16 +99,11 @@ NON_PLOT_CASES = {6, 7, 8, 9, 10, 11}
 
 # ── Format auto-detector ───────────────────────────────────────────────────────
 class FormatDetector:
-    """
-    Sniffs the first SNIFF bytes of the stream.
-    Binary signature: 0xAA followed by a byte in 0..11.
-    If no binary signature found within SNIFF bytes, assumes text.
-    """
     SNIFF = 8
 
     def __init__(self):
         self._buf   = bytearray()
-        self.format = None      # "binary" or "text"
+        self.format = None
 
     def feed(self, byte: int):
         if self.format:
@@ -133,11 +125,6 @@ class FormatDetector:
 
 # ── Binary frame reader ────────────────────────────────────────────────────────
 class BinaryFrameReader:
-    """
-    State-machine parser for:
-      0xAA | case (1 byte) | length (1 byte) | payload (length bytes)
-    Call push(byte) byte-by-byte; collect completed frames with pop_frames().
-    """
     WAIT_SOF, WAIT_CASE, WAIT_LEN, WAIT_PAYLOAD = range(4)
 
     def __init__(self):
@@ -177,7 +164,6 @@ class BinaryFrameReader:
 
 # ── Text line parser ───────────────────────────────────────────────────────────
 def parse_text_line(line: str):
-    """Return (case_id, [str values]) or None."""
     line = line.strip()
     if not line:
         return None
@@ -191,30 +177,68 @@ def parse_text_line(line: str):
     return case_id, parts[1:]
 
 
+# ── Auto-save log writer ───────────────────────────────────────────────────────
+class LogWriter:
+    """
+    Writes incoming raw data to a log file whose format (text/binary)
+    matches the detected stream format.  Thread-safe.
+    """
+    def __init__(self, fmt: str):
+        """fmt: 'text' or 'binary'"""
+        self.fmt      = fmt
+        self._lock    = threading.Lock()
+        ts            = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        ext           = ".csv" if fmt == "text" else ".bin"
+        self.filepath = os.path.join(LOG_DIR, f"tcm_{ts}{ext}")
+        mode          = "w" if fmt == "text" else "wb"
+        self._fh      = open(self.filepath, mode)
+
+    def write_text_line(self, line: str):
+        with self._lock:
+            if self._fh and not self._fh.closed:
+                self._fh.write(line if line.endswith("\n") else line + "\n")
+
+    def write_binary_frame(self, case_id: int, payload: bytes):
+        """Reconstruct the binary frame (SOF | case | len | payload) and write."""
+        with self._lock:
+            if self._fh and not self._fh.closed:
+                frame = bytes([TCM_BIN_SOF, case_id, len(payload)]) + payload
+                self._fh.write(frame)
+
+    def close(self):
+        with self._lock:
+            if self._fh and not self._fh.closed:
+                self._fh.flush()
+                self._fh.close()
+
+
 # ── Serial reader thread ───────────────────────────────────────────────────────
 class SerialReader(threading.Thread):
     """
-    Reads raw bytes, auto-detects format, dispatches to queue as:
-      ("DATA",   case_id, values, fmt)   -- values already parsed for binary
+    Reads raw bytes, auto-detects format, dispatches to queue.
+    Once format is known, creates a LogWriter and saves all frames.
+
+    Queue messages:
+      ("DATA",   case_id, values, fmt)
       ("STATUS", message)
       ("ERROR",  message)
-      ("RAW",    raw_string)             -- exact raw representation for UI
-    Also supports thread-safe writes via write()/write_text().
+      ("RAW",    raw_string)
+      ("LOGFILE", filepath)     -- sent once log file is created
     """
     def __init__(self, port, baud, q: queue.Queue, stop_event: threading.Event):
         super().__init__(daemon=True)
-        self.port       = port
-        self.baud       = baud
-        self.q          = q
-        self.stop_event = stop_event
-        self.ser        = None
+        self.port        = port
+        self.baud        = baud
+        self.q           = q
+        self.stop_event  = stop_event
+        self.ser         = None
         self._write_lock = threading.Lock()
+        self._log        = None     # LogWriter, set after format detected
 
     def run(self):
         try:
             with serial.Serial(self.port, self.baud, timeout=1) as ser:
-                # keep reference so UI can write
-                self.ser = ser
+                self.ser   = ser
                 detector   = FormatDetector()
                 bin_reader = BinaryFrameReader()
                 text_buf   = bytearray()
@@ -227,35 +251,35 @@ class SerialReader(threading.Thread):
                         continue
 
                     for byte in chunk:
+                        # ── detection phase ──
                         if not detector.detected():
                             detector.feed(byte)
                             if detector.detected():
+                                fmt = detector.format
+                                self._log = LogWriter(fmt)
                                 self.q.put(("STATUS",
-                                    f"Format detected: {detector.format.upper()}"))
+                                    f"Format detected: {fmt.upper()}  |  "
+                                    f"Logging → {os.path.basename(self._log.filepath)}"))
+                                self.q.put(("LOGFILE", self._log.filepath))
+                            continue  # still sniffing; don't process yet
 
-                        if not detector.detected():
-                            continue
-
+                        # ── processing phase ──
                         if detector.format == "binary":
                             bin_reader.push(byte)
                             for cid, payload in bin_reader.pop_frames():
-                                # publish a RAW representation for the UI (hex payload)
-                                try:
-                                    raw_str = f"BIN,{cid},{payload.hex()}"
-                                    self.q.put(("RAW", raw_str))
-                                except Exception:
-                                    pass
+                                if self._log:
+                                    self._log.write_binary_frame(cid, payload)
+                                raw_str = f"BIN,{cid},{payload.hex()}"
+                                self.q.put(("RAW", raw_str))
                                 self._dispatch_binary(cid, payload)
                         else:
                             text_buf.append(byte)
                             if byte == ord('\n'):
                                 line = text_buf.decode("ascii", errors="replace")
                                 text_buf.clear()
-                                # publish raw text line for UI
-                                try:
-                                    self.q.put(("RAW", line))
-                                except Exception:
-                                    pass
+                                if self._log:
+                                    self._log.write_text_line(line)
+                                self.q.put(("RAW", line))
                                 result = parse_text_line(line)
                                 if result:
                                     cid, values = result
@@ -264,11 +288,9 @@ class SerialReader(threading.Thread):
         except serial.SerialException as e:
             self.q.put(("ERROR", str(e)))
         finally:
-            # clear serial reference
-            try:
-                self.ser = None
-            except Exception:
-                pass
+            if self._log:
+                self._log.close()
+            self.ser = None
 
     def _dispatch_binary(self, cid, payload):
         if cid in NON_PLOT_CASES:
@@ -280,10 +302,9 @@ class SerialReader(threading.Thread):
             values = CASES[cid]["parse_bin"](payload)
             self.q.put(("DATA", cid, values, "binary"))
         except struct.error:
-            pass    # malformed payload, skip silently
+            pass
 
     def write(self, data: bytes) -> bool:
-        """Thread-safe write of raw bytes to the open serial port. Returns True on success."""
         try:
             with self._write_lock:
                 if self.ser and getattr(self.ser, "is_open", False):
@@ -297,10 +318,8 @@ class SerialReader(threading.Thread):
         return False
 
     def write_text(self, text: str, encoding="ascii") -> bool:
-        """Encode text and write; helper used by UI."""
         try:
-            data = text.encode(encoding, errors="replace")
-            return self.write(data)
+            return self.write(text.encode(encoding, errors="replace"))
         except Exception:
             return False
 
@@ -320,6 +339,7 @@ class TCMPlotter(tk.Tk):
         self.file_path   = tk.StringVar(value="")
         self.status_var  = tk.StringVar(value="Ready.")
         self.format_var  = tk.StringVar(value="--")
+        self.logfile_var = tk.StringVar(value="")
 
         self.serial_stop   = threading.Event()
         self.serial_thread = None
@@ -329,18 +349,16 @@ class TCMPlotter(tk.Tk):
         self.fig           = None
         self.axes          = []
         self.lines         = []
+        self.pv_labels     = []     # list of tk.StringVar, one per channel
         self.canvas_widget = None
         self.running       = False
 
-        # Raw window state
-        self.raw_win   = None
-        self.raw_text  = None
+        self.raw_win        = None
+        self.raw_text       = None
         self.raw_autoscroll = tk.BooleanVar(value=True)
-
-        # Send window state
-        self.send_win   = None
-        self.send_entry = None
-        self.append_nl  = tk.BooleanVar(value=True)
+        self.send_win       = None
+        self.send_entry     = None
+        self.append_nl      = tk.BooleanVar(value=True)
 
         self._build_controls()
         self._refresh_ports()
@@ -355,7 +373,7 @@ class TCMPlotter(tk.Tk):
         ttk.Radiobutton(ctrl, text="Serial Port", variable=self.source_var,
                         value="serial", command=self._on_source_change
                         ).grid(row=0, column=1, sticky=tk.W)
-        ttk.Radiobutton(ctrl, text="Log File", variable=self.source_var,
+        ttk.Radiobutton(ctrl, text="Read From Log File", variable=self.source_var,
                         value="file", command=self._on_source_change
                         ).grid(row=0, column=2, sticky=tk.W)
 
@@ -368,7 +386,7 @@ class TCMPlotter(tk.Tk):
 
         # Port row
         self.port_frame = ttk.Frame(ctrl)
-        self.port_frame.grid(row=1, column=0, columnspan=6, sticky=tk.W, pady=2)
+        self.port_frame.grid(row=1, column=0, columnspan=7, sticky=tk.W, pady=2)
         ttk.Label(self.port_frame, text="Port:").pack(side=tk.LEFT)
         self.port_cb = ttk.Combobox(self.port_frame, textvariable=self.port_var, width=14)
         self.port_cb.pack(side=tk.LEFT, padx=4)
@@ -380,13 +398,21 @@ class TCMPlotter(tk.Tk):
 
         # File row (hidden initially)
         self.file_frame = ttk.Frame(ctrl)
-        self.file_frame.grid(row=2, column=0, columnspan=6, sticky=tk.W, pady=2)
+        self.file_frame.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=2)
         ttk.Label(self.file_frame, text="File:").pack(side=tk.LEFT)
-        ttk.Entry(self.file_frame, textvariable=self.file_path, width=40
+        ttk.Entry(self.file_frame, textvariable=self.file_path, width=44
                   ).pack(side=tk.LEFT, padx=4)
         ttk.Button(self.file_frame, text="Browse...",
                    command=self._browse).pack(side=tk.LEFT)
         self.file_frame.grid_remove()
+
+        # Auto-save log path display (serial mode only)
+        self.logfile_frame = ttk.Frame(ctrl)
+        self.logfile_frame.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=2)
+        ttk.Label(self.logfile_frame, text="Auto-log:").pack(side=tk.LEFT)
+        ttk.Label(self.logfile_frame, textvariable=self.logfile_var,
+                  foreground="#007700", font=("TkDefaultFont", 8)
+                  ).pack(side=tk.LEFT, padx=4)
 
         # Case selector
         ttk.Label(ctrl, text="Case:").grid(row=3, column=0, sticky=tk.W, pady=(6, 2))
@@ -398,7 +424,7 @@ class TCMPlotter(tk.Tk):
 
         # Buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=4, column=0, columnspan=6, sticky=tk.W, pady=6)
+        btn_frame.grid(row=4, column=0, columnspan=7, sticky=tk.W, pady=6)
         self.start_btn = ttk.Button(btn_frame, text="Start", command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(btn_frame, text="Stop",
@@ -406,16 +432,25 @@ class TCMPlotter(tk.Tk):
         self.stop_btn.pack(side=tk.LEFT, padx=(0, 6))
         ttk.Button(btn_frame, text="Save PNG...",
                    command=self._save_png).pack(side=tk.LEFT)
-        ttk.Button(btn_frame, text="Raw...", command=self._open_raw_window).pack(side=tk.LEFT, padx=(6,0))
-        ttk.Button(btn_frame, text="Send...", command=self._open_send_window).pack(side=tk.LEFT, padx=(6,0))
+        ttk.Button(btn_frame, text="Raw...",
+                   command=self._open_raw_window).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_frame, text="Send...",
+                   command=self._open_send_window).pack(side=tk.LEFT, padx=(6, 0))
 
         # Status bar
         ttk.Label(self, textvariable=self.status_var,
                   relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
 
-        # Plot area
-        self.plot_frame = ttk.Frame(self)
-        self.plot_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        # Plot + PV area (side by side)
+        self.main_frame = ttk.Frame(self)
+        self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+
+        self.plot_frame = ttk.Frame(self.main_frame)
+        self.plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+
+        # Present-value panel (right side, fixed width)
+        self.pv_frame = ttk.LabelFrame(self.main_frame, text="Present Values", padding=10)
+        self.pv_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 6), pady=6)
 
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -427,10 +462,13 @@ class TCMPlotter(tk.Tk):
         if self.source_var.get() == "serial":
             self.port_frame.grid()
             self.file_frame.grid_remove()
+            self.logfile_frame.grid()
         else:
             self.port_frame.grid_remove()
             self.file_frame.grid()
+            self.logfile_frame.grid_remove()
         self.format_var.set("--")
+        self.logfile_var.set("")
 
     def _on_case_change(self, _=None):
         idx = self.case_cb.current()
@@ -447,28 +485,55 @@ class TCMPlotter(tk.Tk):
         if path:
             self.file_path.set(path)
 
+    # ── Present-value panel ────────────────────────────────────────────────────
+    def _rebuild_pv_panel(self, channels):
+        """Rebuild the right-hand present-value display for the given channels."""
+        for w in self.pv_frame.winfo_children():
+            w.destroy()
+        self.pv_labels = []
+
+        for ch in channels:
+            sv = tk.StringVar(value="--")
+            self.pv_labels.append(sv)
+            row = ttk.Frame(self.pv_frame)
+            row.pack(fill=tk.X, pady=3)
+            ttk.Label(row, text=ch + ":", anchor=tk.W,
+                      width=20).pack(side=tk.LEFT)
+            ttk.Label(row, textvariable=sv,
+                      font=("Courier", 11, "bold"),
+                      foreground="#0070c0",
+                      width=14, anchor=tk.E).pack(side=tk.RIGHT)
+
+    def _update_pv(self, parsed):
+        """Update present-value StringVars with the latest sample."""
+        for sv, val in zip(self.pv_labels, parsed):
+            if isinstance(val, float):
+                sv.set(f"{val:+.4f}")
+            else:
+                sv.set(str(val))
+
     # ── Raw window ────────────────────────────────────────────────────────────
     def _open_raw_window(self):
         if self.raw_win and tk.Toplevel.winfo_exists(self.raw_win):
             self.raw_win.lift()
             return
-
         self.raw_win = tk.Toplevel(self)
         self.raw_win.title("Raw Data")
         self.raw_win.protocol("WM_DELETE_WINDOW", self._close_raw_window)
         frm = ttk.Frame(self.raw_win, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
-
         top_row = ttk.Frame(frm)
-        top_row.pack(fill=tk.X, pady=(0,6))
-        ttk.Checkbutton(top_row, text="Autoscroll", variable=self.raw_autoscroll).pack(side=tk.LEFT)
-
-        clear_btn = ttk.Button(top_row, text="Clear", command=self._clear_raw)
-        clear_btn.pack(side=tk.RIGHT)
-
-        self.raw_text = scrolledtext.ScrolledText(frm, wrap=tk.NONE, state=tk.DISABLED, height=20)
+        top_row.pack(fill=tk.X, pady=(0, 6))
+        ttk.Checkbutton(top_row, text="Autoscroll",
+                        variable=self.raw_autoscroll).pack(side=tk.LEFT)
+        ttk.Button(top_row, text="Clear",
+                   command=self._clear_raw).pack(side=tk.RIGHT)
+        self.raw_text = scrolledtext.ScrolledText(
+            frm, wrap=tk.NONE, state=tk.DISABLED, height=20)
         try:
-            self.raw_text.configure(background="#0f0f0f", foreground="#e6e6e6", insertbackground="#e6e6e6")
+            self.raw_text.configure(background="#0f0f0f",
+                                    foreground="#e6e6e6",
+                                    insertbackground="#e6e6e6")
         except Exception:
             pass
         self.raw_text.pack(fill=tk.BOTH, expand=True)
@@ -479,7 +544,7 @@ class TCMPlotter(tk.Tk):
                 self.raw_win.destroy()
             except Exception:
                 pass
-        self.raw_win = None
+        self.raw_win  = None
         self.raw_text = None
 
     def _clear_raw(self):
@@ -496,13 +561,12 @@ class TCMPlotter(tk.Tk):
             return
         try:
             self.raw_text.configure(state=tk.NORMAL)
-            self.raw_text.insert(tk.END, line if line.endswith("\n") else line + "\n")
-            # trim old lines if necessary
+            self.raw_text.insert(tk.END,
+                                 line if line.endswith("\n") else line + "\n")
             try:
-                total_lines = int(self.raw_text.index("end-1c").split(".")[0])
-                if total_lines > RAW_WIN_MAX_LINES:
-                    delete_to = total_lines - RAW_WIN_MAX_LINES
-                    self.raw_text.delete("1.0", f"{delete_to}.0")
+                total = int(self.raw_text.index("end-1c").split(".")[0])
+                if total > RAW_WIN_MAX_LINES:
+                    self.raw_text.delete("1.0", f"{total - RAW_WIN_MAX_LINES}.0")
             except Exception:
                 pass
             if self.raw_autoscroll.get():
@@ -515,25 +579,24 @@ class TCMPlotter(tk.Tk):
         if self.send_win and tk.Toplevel.winfo_exists(self.send_win):
             self.send_win.lift()
             return
-
         self.send_win = tk.Toplevel(self)
         self.send_win.title("Send Text")
         self.send_win.transient(self)
         frm = ttk.Frame(self.send_win, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
-
         ttk.Label(frm, text="Text:").grid(row=0, column=0, sticky=tk.W)
         self.send_entry = ttk.Entry(frm, width=50)
-        self.send_entry.grid(row=0, column=1, sticky=tk.W, padx=(6,0))
+        self.send_entry.grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
         self.send_entry.focus_set()
-
-        ttk.Checkbutton(frm, text="Append newline", variable=self.append_nl).grid(row=1, column=1, sticky=tk.W, pady=(6,0))
-
+        ttk.Checkbutton(frm, text="Append newline",
+                        variable=self.append_nl
+                        ).grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
         btn_row = ttk.Frame(frm)
-        btn_row.grid(row=2, column=0, columnspan=2, pady=(8,0), sticky=tk.E)
-        ttk.Button(btn_row, text="Send", command=self._on_send_clicked).pack(side=tk.LEFT, padx=(0,6))
-        ttk.Button(btn_row, text="Close", command=self._close_send_window).pack(side=tk.LEFT)
-
+        btn_row.grid(row=2, column=0, columnspan=2, pady=(8, 0), sticky=tk.E)
+        ttk.Button(btn_row, text="Send",
+                   command=self._on_send_clicked).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btn_row, text="Close",
+                   command=self._close_send_window).pack(side=tk.LEFT)
         self.send_entry.bind("<Return>", lambda e: self._on_send_clicked())
 
     def _close_send_window(self):
@@ -542,28 +605,31 @@ class TCMPlotter(tk.Tk):
                 self.send_win.destroy()
             except Exception:
                 pass
-        self.send_win = None
+        self.send_win   = None
         self.send_entry = None
 
     def _on_send_clicked(self):
         text = (self.send_entry.get() if self.send_entry else "")
         if self.append_nl.get():
-            text = text + "\n"
+            text += "\n"
         self._send_text_to_device(text)
 
     def _send_text_to_device(self, text: str):
         if self.source_var.get() != "serial":
-            messagebox.showerror("Not serial", "Switch to Serial source to send text.")
+            messagebox.showerror("Not serial",
+                                 "Switch to Serial source to send text.")
             return
         if not self.serial_thread:
-            messagebox.showerror("No serial", "Start a serial session first.")
+            messagebox.showerror("No serial",
+                                 "Start a serial session first.")
             return
         ok = self.serial_thread.write_text(text)
         if ok:
-            disp = text if len(text) <= 80 else (text[:77] + "...")
-            self.status_var.set(f"Sent → {disp!r}")
+            disp = text if len(text) <= 80 else text[:77] + "..."
+            self.status_var.set(f"Sent -> {disp!r}")
         else:
-            messagebox.showerror("Send failed", "Could not write to serial port. See status for details.")
+            messagebox.showerror("Send failed",
+                                 "Could not write to serial port.")
 
     # ── Plot builder ───────────────────────────────────────────────────────────
     def _rebuild_plot(self):
@@ -580,7 +646,11 @@ class TCMPlotter(tk.Tk):
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
-        self.buffers = {ch: deque([0.0] * WINDOW, maxlen=WINDOW) for ch in channels}
+        # Rebuild present-value panel for new channel set
+        self._rebuild_pv_panel(channels)
+
+        self.buffers = {ch: deque([0.0] * WINDOW, maxlen=WINDOW)
+                        for ch in channels}
         xs = list(range(WINDOW))
 
         self.fig, axes_raw = plt.subplots(n, 1,
@@ -609,7 +679,6 @@ class TCMPlotter(tk.Tk):
         self.canvas_widget = canvas
 
         if self.source_var.get() == "serial":
-            # use blit=False to avoid backend resize issues in some environments
             self.anim = animation.FuncAnimation(
                 self.fig, self._animate, interval=INTERVAL,
                 blit=False, cache_frame_data=False
@@ -621,6 +690,7 @@ class TCMPlotter(tk.Tk):
         case_id = self.case_var.get()
         meta    = CASES[case_id]
         updated = False
+        last_parsed = None
 
         while not self.data_queue.empty():
             item = self.data_queue.get_nowait()
@@ -643,6 +713,10 @@ class TCMPlotter(tk.Tk):
                 self._append_raw_line(item[1])
                 continue
 
+            if item[0] == "LOGFILE":
+                self.logfile_var.set(os.path.basename(item[1]))
+                continue
+
             # ("DATA", cid, values, fmt)
             _, cid, values, fmt = item
 
@@ -662,6 +736,7 @@ class TCMPlotter(tk.Tk):
 
                 for ch, val in zip(meta["channels"], parsed):
                     self.buffers[ch].append(val)
+                last_parsed = parsed
                 updated = True
             except Exception:
                 pass
@@ -672,6 +747,9 @@ class TCMPlotter(tk.Tk):
             for ax in self.axes:
                 ax.relim()
                 ax.autoscale_view(scalex=False)
+            # Update present-value display with most recent sample
+            if last_parsed is not None:
+                self._update_pv(last_parsed)
 
         return self.lines
 
@@ -679,6 +757,7 @@ class TCMPlotter(tk.Tk):
     def _start(self):
         self.running = True
         self.format_var.set("--")
+        self.logfile_var.set("")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
         self._rebuild_plot()
@@ -712,7 +791,6 @@ class TCMPlotter(tk.Tk):
             self._stop()
             return
 
-        # Peek at first byte to decide format
         with open(path, "rb") as f:
             first = f.read(1)
         is_binary = bool(first and first[0] == TCM_BIN_SOF)
@@ -777,6 +855,11 @@ class TCMPlotter(tk.Tk):
             ax.autoscale_view()
 
         self.canvas_widget.draw()
+
+        # Show last sample as present values
+        last = [data[ch][-1] for ch in channels]
+        self._update_pv(last)
+
         self.status_var.set(
             f"[{fmt_label}] {n_samples} samples loaded  "
             f"({skipped} frames from other cases skipped)"
@@ -814,7 +897,7 @@ class TCMPlotter(tk.Tk):
         self.destroy()
 
 
-# ── Entry point ───────────────────────────────────────────────────────────────
+# ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = TCMPlotter()
     app.mainloop()
