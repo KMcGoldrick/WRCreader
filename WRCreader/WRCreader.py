@@ -377,6 +377,9 @@ class TCMPlotter(tk.Tk):
         # Track last message sent (display in main window) - must exist before building controls
         self.last_sent_var = tk.StringVar(value="")
 
+        # Pending auto-switch case (scheduled from animation callback)
+        self._pending_auto_case = None
+
         self._build_controls()
         self._refresh_ports()
 
@@ -767,9 +770,11 @@ class TCMPlotter(tk.Tk):
         case_id  = self.case_var.get()
         meta     = CASES[case_id]
         channels = list(meta["channels"])
-        # add derived magnitude channel for case 3
+        # add derived magnitude channel for case 3 and case 4
         if case_id == 3:
-            channels = channels + ["sqrt(x+y+z**2) s/b 1.0"]
+            channels = channels + ["Acc magnitude"]
+        elif case_id == 4:
+            channels = channels + ["Mag magnitude"]
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
@@ -853,24 +858,22 @@ class TCMPlotter(tk.Tk):
                     f"Cal/config case {cid} received ({fmt.upper()})")
                 continue
 
-            # If we see data for a different plottable case, switch the UI/plot
+            # If we see data for a different plottable case, schedule a UI rebuild
+            # on the main thread instead of calling _rebuild_plot directly here.
+            # This avoids closing/recreating the figure while the animation timer
+            # is executing (which can lead to None event_source errors).
             if cid != case_id:
                 if cid in CASES:
-                    try:
-                        # Update combobox/programmatic selection without sending command
-                        self._suppress_case_send = True
-                        keys_sorted = sorted(CASES)
-                        idx = keys_sorted.index(cid)
-                        self.case_cb.current(idx)
-                        self.case_var.set(cid)
-                        # Rebuild plot immediately for the new case
-                        self._rebuild_plot()
-                        self.status_var.set(f"Auto-switched to case {cid}")
-                        # Update local references for subsequent processing
-                        case_id = cid
-                        meta = CASES[case_id]
-                    finally:
-                        self._suppress_case_send = False
+                    # schedule only once per pending case
+                    if self._pending_auto_case != cid:
+                        self._pending_auto_case = cid
+                        try:
+                            self.after(0, lambda c=cid: self._apply_pending_auto_case(c))
+                        except Exception:
+                            # best-effort fallback: call directly (rare)
+                            self._apply_pending_auto_case(cid)
+                    # skip processing this frame (plot will be rebuilt shortly)
+                    continue
                 else:
                     # unknown case, ignore
                     continue
@@ -882,8 +885,8 @@ class TCMPlotter(tk.Tk):
                     # values from binary case are already numeric lists
                     parsed = [float(v) for v in values]
 
-                # For case 3 compute derived magnitude from scaled values (indices 3,4,5)
-                if case_id == 3:
+                # For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
+                if case_id == 3 or case_id == 4:
                     try:
                         sx = float(parsed[3])
                         sy = float(parsed[4])
@@ -893,10 +896,12 @@ class TCMPlotter(tk.Tk):
                         mag = 0.0
                     parsed = list(parsed) + [mag]
 
-                # Determine channels list including derived channel for case 3
+                # Determine channels list including derived channel for case 3 or 4
                 channels = list(meta["channels"])
                 if case_id == 3:
                     channels = channels + ["Acc magnitude (scaled)"]
+                elif case_id == 4:
+                    channels = channels + ["Mag magnitude (scaled)"]
 
                 # Ensure buffers exist and append values
                 for ch, val in zip(channels, parsed):
@@ -910,10 +915,12 @@ class TCMPlotter(tk.Tk):
                 pass
 
         if updated:
-            # Use channels matching current case (include derived if case 3)
+            # Use channels matching current case (include derived if case 3/4)
             channels = list(meta["channels"])
             if case_id == 3:
                 channels = channels + ["Acc magnitude (scaled)"]
+            elif case_id == 4:
+                channels = channels + ["Mag magnitude (scaled)"]
             for ln, ch in zip(self.lines, channels):
                 ln.set_ydata(list(self.buffers[ch]))
             for ax in self.axes:
@@ -973,6 +980,8 @@ class TCMPlotter(tk.Tk):
         channels = list(meta["channels"])
         if case_id == 3:
             channels = channels + ["Acc magnitude (scaled)"]
+        elif case_id == 4:
+            channels = channels + ["Mag magnitude (scaled)"]
         data     = {ch: [] for ch in channels}
         skipped  = 0
 
@@ -990,7 +999,7 @@ class TCMPlotter(tk.Tk):
                             continue
                         try:
                             parsed = meta["parse_bin"](payload)
-                            if case_id == 3:
+                            if case_id == 3 or case_id == 4:
                                 try:
                                     sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
                                     mag = math.sqrt(sx*sx + sy*sy + sz*sz)
@@ -1013,7 +1022,7 @@ class TCMPlotter(tk.Tk):
                         continue
                     try:
                         parsed = meta["parse_text"](values)
-                        if case_id == 3:
+                        if case_id == 3 or case_id == 4:
                             try:
                                 sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
                                 mag = math.sqrt(sx*sx + sy*sy + sz*sz)
@@ -1083,7 +1092,29 @@ class TCMPlotter(tk.Tk):
         self._close_send_window()
         self.destroy()
 
-
+    def _apply_pending_auto_case(self, cid: int):
+        """
+        Apply an automatic case switch that was scheduled from the animation
+        callback.  Run on the main/UI thread to avoid interfering with the
+        running animation timer.
+        """
+        try:
+            self._suppress_case_send = True
+            keys_sorted = sorted(CASES)
+            if cid in keys_sorted:
+                idx = keys_sorted.index(cid)
+                # update combobox and internal state without sending to device
+                try:
+                    self.case_cb.current(idx)
+                except Exception:
+                    pass
+                self.case_var.set(cid)
+                # rebuild plot for the new case
+                self._rebuild_plot()
+                self.status_var.set(f"Auto-switched to case {cid}")
+        finally:
+            self._suppress_case_send = False
+            self._pending_auto_case = None
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = TCMPlotter()
