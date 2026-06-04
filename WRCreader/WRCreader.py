@@ -29,6 +29,7 @@ Usage:
   python tcm_plotter.py
 """
 
+import math
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.scrolledtext as scrolledtext
@@ -37,6 +38,7 @@ import queue
 import struct
 import os
 import datetime
+from pathlib import Path
 
 import serial
 import serial.tools.list_ports
@@ -53,7 +55,19 @@ BAUDRATE         = 115200
 INTERVAL         = 50           # animation refresh ms
 TCM_BIN_SOF      = 0xAA
 RAW_WIN_MAX_LINES = 2000
-LOG_DIR          = os.path.dirname(os.path.abspath(__file__))
+
+# LOG_DIR: prefer the user's Downloads folder, fall back to script directory
+try:
+    _script_dir = Path(__file__).resolve().parent
+except Exception:
+    _script_dir = Path(os.path.abspath(os.path.dirname(__file__)))
+_downloads = Path.home() / "Downloads"
+try:
+    # Ensure the downloads directory exists (safe no-op if already present)
+    _downloads.mkdir(parents=True, exist_ok=True)
+    LOG_DIR = str(_downloads)
+except Exception:
+    LOG_DIR = str(_script_dir)
 
 # ── Case metadata ──────────────────────────────────────────────────────────────
 CASES = {
@@ -360,8 +374,15 @@ class TCMPlotter(tk.Tk):
         self.send_entry     = None
         self.append_nl      = tk.BooleanVar(value=True)
 
+        # Track last message sent (display in main window) - must exist before building controls
+        self.last_sent_var = tk.StringVar(value="")
+
         self._build_controls()
         self._refresh_ports()
+
+        # When True we suppress sending a case-change command to the device.
+        # Useful when the combobox is changed programmatically.
+        self._suppress_case_send = False
 
     # ── UI ─────────────────────────────────────────────────────────────────────
     def _build_controls(self):
@@ -383,6 +404,10 @@ class TCMPlotter(tk.Tk):
                   foreground="#0070c0",
                   font=("TkDefaultFont", 9, "bold")
                   ).grid(row=0, column=4, sticky=tk.W)
+
+        # Last-sent indicator (main window)
+        ttk.Label(ctrl, text="Last Sent:").grid(row=0, column=5, sticky=tk.W)
+        ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=0, column=6, sticky=tk.W)
 
         # Port row
         self.port_frame = ttk.Frame(ctrl)
@@ -437,21 +462,6 @@ class TCMPlotter(tk.Tk):
         ttk.Button(btn_frame, text="Send...",
                    command=self._open_send_window).pack(side=tk.LEFT, padx=(6, 0))
 
-        # Status bar
-        ttk.Label(self, textvariable=self.status_var,
-                  relief=tk.SUNKEN, anchor=tk.W).pack(side=tk.BOTTOM, fill=tk.X)
-
-        # Plot + PV area (side by side)
-        self.main_frame = ttk.Frame(self)
-        self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
-
-        self.plot_frame = ttk.Frame(self.main_frame)
-        self.plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
-
-        # Present-value panel (right side, fixed width)
-        self.pv_frame = ttk.LabelFrame(self.main_frame, text="Present Values", padding=10)
-        self.pv_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 6), pady=6)
-
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
         self.port_cb["values"] = ports
@@ -471,10 +481,95 @@ class TCMPlotter(tk.Tk):
         self.logfile_var.set("")
 
     def _on_case_change(self, _=None):
+        """
+        Called when the Case combobox selection changes.
+
+        - For manual (user) changes on a serial session: disable the combobox,
+          send the "[<case>]\n" command on a background thread, wait for write
+          result and only then update the UI/plot (or revert on failure).
+        - For programmatic changes (self._suppress_case_send True) or when not
+          in serial mode, apply immediately.
+        """
+        keys_sorted = sorted(CASES)
         idx = self.case_cb.current()
-        self.case_var.set(sorted(CASES)[idx])
-        if self.running:
-            self._rebuild_plot()
+        if idx < 0 or idx >= len(keys_sorted):
+            return
+        new_case = keys_sorted[idx]
+        prev_case = self.case_var.get()
+
+        # Programmatic changes should not send command; just apply
+        if getattr(self, "_suppress_case_send", False):
+            self.case_var.set(new_case)
+            if self.running:
+                self._rebuild_plot()
+            return
+
+        # If not serial or no active serial thread, apply immediately
+        if self.source_var.get() != "serial" or not self.serial_thread:
+            self.case_var.set(new_case)
+            if self.running:
+                self._rebuild_plot()
+            return
+
+        # Manual change in serial mode: send command and wait for write result.
+        # Disable combobox to prevent further user changes while send is in-flight.
+        try:
+            self.case_cb.config(state="disabled")
+        except Exception:
+            pass
+        self.status_var.set(f"Sending case-change {new_case}...")
+
+        # Background sender thread: perform write_text and marshal result back to UI thread.
+        def _send_case_and_apply(case_to_send, prev):
+            # Use square-bracket command format as requested
+            cmd = f"[{case_to_send}\n"
+            ok = False
+            try:
+                ok = self.serial_thread.write_text(cmd)
+            except Exception:
+                ok = False
+
+            def _on_result():
+                # re-enable combobox
+                try:
+                    self.case_cb.config(state="readonly")
+                except Exception:
+                    pass
+
+                if ok:
+                    # Apply new case and rebuild plot (if running)
+                    self.case_var.set(case_to_send)
+                    if self.running:
+                        self._rebuild_plot()
+                    self.status_var.set(f"Sent -> {cmd.strip()}")
+                    # record last sent command for user
+                    try:
+                        self.last_sent_var.set(cmd.strip())
+                    except Exception:
+                        pass
+                else:
+                    # revert combobox to previous selection and notify user
+                    self.status_var.set("Send failed")
+                    # restore combobox selection without re-sending
+                    try:
+                        self._suppress_case_send = True
+                        prev_idx = keys_sorted.index(prev) if prev in keys_sorted else 0
+                        self.case_cb.current(prev_idx)
+                        self.case_var.set(prev)
+                    finally:
+                        self._suppress_case_send = False
+                    messagebox.showerror("Send failed",
+                                         f"Could not send case-change command: {cmd.strip()}")
+
+            # schedule UI update on main thread
+            try:
+                self.after(0, _on_result)
+            except Exception:
+                # fallback: try calling directly (rare)
+                _on_result()
+
+        t = threading.Thread(target=_send_case_and_apply, args=(new_case, prev_case), daemon=True)
+        t.start()
 
     def _browse(self):
         path = filedialog.askopenfilename(
@@ -488,6 +583,16 @@ class TCMPlotter(tk.Tk):
     # ── Present-value panel ────────────────────────────────────────────────────
     def _rebuild_pv_panel(self, channels):
         """Rebuild the right-hand present-value display for the given channels."""
+        # Defensive: ensure the container exists (fixes AttributeError when called
+        # before _build_controls completed or if main_frame/pv_frame were removed).
+        if not hasattr(self, "main_frame") or self.main_frame is None:
+            # create a minimal container so the PV panel can be shown
+            self.main_frame = ttk.Frame(self)
+            self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        if not hasattr(self, "pv_frame") or self.pv_frame is None:
+            self.pv_frame = ttk.LabelFrame(self.main_frame, text="Present Values", padding=10)
+            self.pv_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 6), pady=6)
+
         for w in self.pv_frame.winfo_children():
             w.destroy()
         self.pv_labels = []
@@ -497,15 +602,18 @@ class TCMPlotter(tk.Tk):
             self.pv_labels.append(sv)
             row = ttk.Frame(self.pv_frame)
             row.pack(fill=tk.X, pady=3)
-            ttk.Label(row, text=ch + ":", anchor=tk.W,
-                      width=20).pack(side=tk.LEFT)
-            ttk.Label(row, textvariable=sv,
-                      font=("Courier", 11, "bold"),
-                      foreground="#0070c0",
-                      width=14, anchor=tk.E).pack(side=tk.RIGHT)
+            ttk.Label(row, text=ch + ":", anchor=tk.W, width=20).pack(side=tk.LEFT)
+            # use tk.Label so fg is honored across platforms/themes
+            lbl = tk.Label(row, textvariable=sv,
+                           font=("Courier", 11, "bold"),
+                           fg="#0070c0",
+                           width=14, anchor=tk.E)
+            lbl.pack(side=tk.RIGHT)
 
     def _update_pv(self, parsed):
         """Update present-value StringVars with the latest sample."""
+        if parsed is None:
+            return
         for sv, val in zip(self.pv_labels, parsed):
             if isinstance(val, float):
                 sv.set(f"{val:+.4f}")
@@ -589,8 +697,7 @@ class TCMPlotter(tk.Tk):
         self.send_entry.grid(row=0, column=1, sticky=tk.W, padx=(6, 0))
         self.send_entry.focus_set()
         ttk.Checkbutton(frm, text="Append newline",
-                        variable=self.append_nl
-                        ).grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
+                        variable=self.append_nl).grid(row=1, column=1, sticky=tk.W, pady=(6, 0))
         btn_row = ttk.Frame(frm)
         btn_row.grid(row=2, column=0, columnspan=2, pady=(8, 0), sticky=tk.E)
         ttk.Button(btn_row, text="Send",
@@ -627,6 +734,11 @@ class TCMPlotter(tk.Tk):
         if ok:
             disp = text if len(text) <= 80 else text[:77] + "..."
             self.status_var.set(f"Sent -> {disp!r}")
+            try:
+                # store plain text (trim newline) for display
+                self.last_sent_var.set(disp.rstrip("\n"))
+            except Exception:
+                pass
         else:
             messagebox.showerror("Send failed",
                                  "Could not write to serial port.")
@@ -640,9 +752,24 @@ class TCMPlotter(tk.Tk):
             self.canvas_widget.get_tk_widget().destroy()
             plt.close(self.fig)
 
+        # Defensive: ensure main_frame / plot_frame / pv_frame exist (fixes
+        # AttributeError when _rebuild_plot is invoked before full UI setup).
+        if not hasattr(self, "main_frame") or self.main_frame is None:
+            self.main_frame = ttk.Frame(self)
+            self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
+        if not hasattr(self, "plot_frame") or self.plot_frame is None:
+            self.plot_frame = ttk.Frame(self.main_frame)
+            self.plot_frame.pack(side=tk.LEFT, fill=tk.BOTH, expand=True)
+        if not hasattr(self, "pv_frame") or self.pv_frame is None:
+            self.pv_frame = ttk.LabelFrame(self.main_frame, text="Present Values", padding=10)
+            self.pv_frame.pack(side=tk.RIGHT, fill=tk.Y, padx=(4, 6), pady=6)
+
         case_id  = self.case_var.get()
         meta     = CASES[case_id]
-        channels = meta["channels"]
+        channels = list(meta["channels"])
+        # add derived magnitude channel for case 3
+        if case_id == 3:
+            channels = channels + ["sqrt(x+y+z**2) s/b 1.0"]
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
@@ -720,34 +847,78 @@ class TCMPlotter(tk.Tk):
             # ("DATA", cid, values, fmt)
             _, cid, values, fmt = item
 
+            # Calibration/config cases are logged to status only
             if cid in NON_PLOT_CASES:
                 self.status_var.set(
                     f"Cal/config case {cid} received ({fmt.upper()})")
                 continue
 
+            # If we see data for a different plottable case, switch the UI/plot
             if cid != case_id:
-                continue
+                if cid in CASES:
+                    try:
+                        # Update combobox/programmatic selection without sending command
+                        self._suppress_case_send = True
+                        keys_sorted = sorted(CASES)
+                        idx = keys_sorted.index(cid)
+                        self.case_cb.current(idx)
+                        self.case_var.set(cid)
+                        # Rebuild plot immediately for the new case
+                        self._rebuild_plot()
+                        self.status_var.set(f"Auto-switched to case {cid}")
+                        # Update local references for subsequent processing
+                        case_id = cid
+                        meta = CASES[case_id]
+                    finally:
+                        self._suppress_case_send = False
+                else:
+                    # unknown case, ignore
+                    continue
 
             try:
                 if fmt == "text":
                     parsed = meta["parse_text"](values)
                 else:
+                    # values from binary case are already numeric lists
                     parsed = [float(v) for v in values]
 
-                for ch, val in zip(meta["channels"], parsed):
+                # For case 3 compute derived magnitude from scaled values (indices 3,4,5)
+                if case_id == 3:
+                    try:
+                        sx = float(parsed[3])
+                        sy = float(parsed[4])
+                        sz = float(parsed[5])
+                        mag = math.sqrt(sx * sx + sy * sy + sz * sz)
+                    except Exception:
+                        mag = 0.0
+                    parsed = list(parsed) + [mag]
+
+                # Determine channels list including derived channel for case 3
+                channels = list(meta["channels"])
+                if case_id == 3:
+                    channels = channels + ["Acc magnitude (scaled)"]
+
+                # Ensure buffers exist and append values
+                for ch, val in zip(channels, parsed):
+                    if ch not in self.buffers:
+                        self.buffers[ch] = deque([0.0] * WINDOW, maxlen=WINDOW)
                     self.buffers[ch].append(val)
+
                 last_parsed = parsed
                 updated = True
             except Exception:
                 pass
 
         if updated:
-            for ln, ch in zip(self.lines, meta["channels"]):
+            # Use channels matching current case (include derived if case 3)
+            channels = list(meta["channels"])
+            if case_id == 3:
+                channels = channels + ["Acc magnitude (scaled)"]
+            for ln, ch in zip(self.lines, channels):
                 ln.set_ydata(list(self.buffers[ch]))
             for ax in self.axes:
                 ax.relim()
                 ax.autoscale_view(scalex=False)
-            # Update present-value display with most recent sample
             if last_parsed is not None:
                 self._update_pv(last_parsed)
 
@@ -799,7 +970,9 @@ class TCMPlotter(tk.Tk):
 
         case_id  = self.case_var.get()
         meta     = CASES[case_id]
-        channels = meta["channels"]
+        channels = list(meta["channels"])
+        if case_id == 3:
+            channels = channels + ["Acc magnitude (scaled)"]
         data     = {ch: [] for ch in channels}
         skipped  = 0
 
@@ -817,6 +990,13 @@ class TCMPlotter(tk.Tk):
                             continue
                         try:
                             parsed = meta["parse_bin"](payload)
+                            if case_id == 3:
+                                try:
+                                    sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
+                                    mag = math.sqrt(sx*sx + sy*sy + sz*sz)
+                                except Exception:
+                                    mag = 0.0
+                                parsed = list(parsed) + [mag]
                             for ch, val in zip(channels, parsed):
                                 data[ch].append(float(val))
                         except struct.error:
@@ -833,6 +1013,13 @@ class TCMPlotter(tk.Tk):
                         continue
                     try:
                         parsed = meta["parse_text"](values)
+                        if case_id == 3:
+                            try:
+                                sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
+                                mag = math.sqrt(sx*sx + sy*sy + sz*sz)
+                            except Exception:
+                                mag = 0.0
+                            parsed = list(parsed) + [mag]
                         for ch, val in zip(channels, parsed):
                             data[ch].append(float(val))
                     except Exception:
