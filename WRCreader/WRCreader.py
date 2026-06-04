@@ -63,7 +63,6 @@ except Exception:
     _script_dir = Path(os.path.abspath(os.path.dirname(__file__)))
 _downloads = Path.home() / "Downloads"
 try:
-    # Ensure the downloads directory exists (safe no-op if already present)
     _downloads.mkdir(parents=True, exist_ok=True)
     LOG_DIR = str(_downloads)
 except Exception:
@@ -374,6 +373,9 @@ class TCMPlotter(tk.Tk):
         self.send_entry     = None
         self.append_nl      = tk.BooleanVar(value=True)
 
+        # Show angles in degrees when True, radians when False
+        self.show_degrees = tk.BooleanVar(value=True)
+
         # Track last message sent (display in main window) - must exist before building controls
         self.last_sent_var = tk.StringVar(value="")
 
@@ -408,13 +410,18 @@ class TCMPlotter(tk.Tk):
                   font=("TkDefaultFont", 9, "bold")
                   ).grid(row=0, column=4, sticky=tk.W)
 
+        # Angle units toggle (rad/deg)
+        ttk.Checkbutton(ctrl, text="Degrees",
+                        variable=self.show_degrees,
+                        command=self._on_angle_toggle).grid(row=0, column=5, sticky=tk.W, padx=(8,0))
+
         # Last-sent indicator (main window)
-        ttk.Label(ctrl, text="Last Sent:").grid(row=0, column=5, sticky=tk.W)
-        ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=0, column=6, sticky=tk.W)
+        ttk.Label(ctrl, text="Last Sent:").grid(row=0, column=6, sticky=tk.W)
+        ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=0, column=7, sticky=tk.W)
 
         # Port row
         self.port_frame = ttk.Frame(ctrl)
-        self.port_frame.grid(row=1, column=0, columnspan=7, sticky=tk.W, pady=2)
+        self.port_frame.grid(row=1, column=0, columnspan=8, sticky=tk.W, pady=2)
         ttk.Label(self.port_frame, text="Port:").pack(side=tk.LEFT)
         self.port_cb = ttk.Combobox(self.port_frame, textvariable=self.port_var, width=14)
         self.port_cb.pack(side=tk.LEFT, padx=4)
@@ -426,7 +433,7 @@ class TCMPlotter(tk.Tk):
 
         # File row (hidden initially)
         self.file_frame = ttk.Frame(ctrl)
-        self.file_frame.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=2)
+        self.file_frame.grid(row=2, column=0, columnspan=8, sticky=tk.W, pady=2)
         ttk.Label(self.file_frame, text="File:").pack(side=tk.LEFT)
         ttk.Entry(self.file_frame, textvariable=self.file_path, width=44
                   ).pack(side=tk.LEFT, padx=4)
@@ -436,23 +443,23 @@ class TCMPlotter(tk.Tk):
 
         # Auto-save log path display (serial mode only)
         self.logfile_frame = ttk.Frame(ctrl)
-        self.logfile_frame.grid(row=2, column=0, columnspan=7, sticky=tk.W, pady=2)
+        self.logfile_frame.grid(row=3, column=0, columnspan=8, sticky=tk.W, pady=2)
         ttk.Label(self.logfile_frame, text="Auto-log:").pack(side=tk.LEFT)
         ttk.Label(self.logfile_frame, textvariable=self.logfile_var,
                   foreground="#007700", font=("TkDefaultFont", 8)
                   ).pack(side=tk.LEFT, padx=4)
 
         # Case selector
-        ttk.Label(ctrl, text="Case:").grid(row=3, column=0, sticky=tk.W, pady=(6, 2))
+        ttk.Label(ctrl, text="Case:").grid(row=4, column=0, sticky=tk.W, pady=(6, 2))
         case_opts = [CASES[k]["label"] for k in sorted(CASES)]
-        self.case_cb = ttk.Combobox(ctrl, values=case_opts, state="readonly", width=28)
+        self.case_cb = ttk.Combobox(ctrl, values=case_opts, state="readonly", width=36)
         self.case_cb.current(0)
-        self.case_cb.grid(row=3, column=1, columnspan=3, sticky=tk.W, pady=(6, 2))
+        self.case_cb.grid(row=4, column=1, columnspan=5, sticky=tk.W, pady=(6, 2))
         self.case_cb.bind("<<ComboboxSelected>>", self._on_case_change)
 
         # Buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=4, column=0, columnspan=7, sticky=tk.W, pady=6)
+        btn_frame.grid(row=5, column=0, columnspan=8, sticky=tk.W, pady=6)
         self.start_btn = ttk.Button(btn_frame, text="Start", command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(btn_frame, text="Stop",
@@ -482,6 +489,17 @@ class TCMPlotter(tk.Tk):
             self.logfile_frame.grid_remove()
         self.format_var.set("--")
         self.logfile_var.set("")
+
+    def _on_angle_toggle(self):
+        """
+        Called when the Degrees checkbutton changes.
+        Rebuild the plot so channel labels and units update immediately.
+        """
+        val = self.show_degrees.get()
+        self.status_var.set("Angle units: " + ("DEG" if val else "RAD"))
+        if self.running:
+            # Rebuild plot to update labels and derived conversions
+            self._rebuild_plot()
 
     def _on_case_change(self, _=None):
         """
@@ -525,7 +543,7 @@ class TCMPlotter(tk.Tk):
         # Background sender thread: perform write_text and marshal result back to UI thread.
         def _send_case_and_apply(case_to_send, prev):
             # Use square-bracket command format as requested
-            cmd = f"[{case_to_send}\n"
+            cmd = f"[{case_to_send}]\n"
             ok = False
             try:
                 ok = self.serial_thread.write_text(cmd)
@@ -568,7 +586,6 @@ class TCMPlotter(tk.Tk):
             try:
                 self.after(0, _on_result)
             except Exception:
-                # fallback: try calling directly (rare)
                 _on_result()
 
         t = threading.Thread(target=_send_case_and_apply, args=(new_case, prev_case), daemon=True)
@@ -586,10 +603,7 @@ class TCMPlotter(tk.Tk):
     # ── Present-value panel ────────────────────────────────────────────────────
     def _rebuild_pv_panel(self, channels):
         """Rebuild the right-hand present-value display for the given channels."""
-        # Defensive: ensure the container exists (fixes AttributeError when called
-        # before _build_controls completed or if main_frame/pv_frame were removed).
         if not hasattr(self, "main_frame") or self.main_frame is None:
-            # create a minimal container so the PV panel can be shown
             self.main_frame = ttk.Frame(self)
             self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
         if not hasattr(self, "pv_frame") or self.pv_frame is None:
@@ -606,7 +620,6 @@ class TCMPlotter(tk.Tk):
             row = ttk.Frame(self.pv_frame)
             row.pack(fill=tk.X, pady=3)
             ttk.Label(row, text=ch + ":", anchor=tk.W, width=20).pack(side=tk.LEFT)
-            # use tk.Label so fg is honored across platforms/themes
             lbl = tk.Label(row, textvariable=sv,
                            font=("Courier", 11, "bold"),
                            fg="#0070c0",
@@ -748,15 +761,24 @@ class TCMPlotter(tk.Tk):
 
     # ── Plot builder ───────────────────────────────────────────────────────────
     def _rebuild_plot(self):
+        # Stop and remove existing animation/figure safely
         if self.anim:
-            self.anim.event_source.stop()
+            try:
+                self.anim.event_source.stop()
+            except Exception:
+                pass
             self.anim = None
         if self.canvas_widget:
-            self.canvas_widget.get_tk_widget().destroy()
-            plt.close(self.fig)
+            try:
+                self.canvas_widget.get_tk_widget().destroy()
+            except Exception:
+                pass
+            try:
+                plt.close(self.fig)
+            except Exception:
+                pass
 
-        # Defensive: ensure main_frame / plot_frame / pv_frame exist (fixes
-        # AttributeError when _rebuild_plot is invoked before full UI setup).
+        # Defensive containers
         if not hasattr(self, "main_frame") or self.main_frame is None:
             self.main_frame = ttk.Frame(self)
             self.main_frame.pack(side=tk.BOTTOM, fill=tk.BOTH, expand=True)
@@ -770,11 +792,27 @@ class TCMPlotter(tk.Tk):
         case_id  = self.case_var.get()
         meta     = CASES[case_id]
         channels = list(meta["channels"])
+
         # add derived magnitude channel for case 3 and case 4
         if case_id == 3:
-            channels = channels + ["Acc magnitude"]
+            channels = channels + ["Acc magnitude (scaled)"]
         elif case_id == 4:
-            channels = channels + ["Mag magnitude"]
+            channels = channels + ["Mag magnitude (scaled)"]
+
+        # Adjust angle channel labels when toggling rad/deg
+        if case_id == 1:
+            if self.show_degrees.get():
+                channels[0] = "Heading (deg)"
+            else:
+                channels[0] = "Heading (rad)"
+        elif case_id == 2:
+            if self.show_degrees.get():
+                channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
+            else:
+                channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
+            if case_id == 2 and (case_id == 3 or case_id == 4):
+                pass  # no-op, kept for style parity
+
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
@@ -859,31 +897,40 @@ class TCMPlotter(tk.Tk):
                 continue
 
             # If we see data for a different plottable case, schedule a UI rebuild
-            # on the main thread instead of calling _rebuild_plot directly here.
-            # This avoids closing/recreating the figure while the animation timer
-            # is executing (which can lead to None event_source errors).
             if cid != case_id:
                 if cid in CASES:
-                    # schedule only once per pending case
                     if self._pending_auto_case != cid:
                         self._pending_auto_case = cid
                         try:
                             self.after(0, lambda c=cid: self._apply_pending_auto_case(c))
                         except Exception:
-                            # best-effort fallback: call directly (rare)
                             self._apply_pending_auto_case(cid)
-                    # skip processing this frame (plot will be rebuilt shortly)
                     continue
                 else:
-                    # unknown case, ignore
                     continue
 
             try:
+                # parsed becomes a list of numeric values
                 if fmt == "text":
                     parsed = meta["parse_text"](values)
                 else:
-                    # values from binary case are already numeric lists
                     parsed = [float(v) for v in values]
+
+                # Angle unit convert for case 1 and 2 according to toggle:
+                if case_id == 1:
+                    # case 1 input is heading in degrees
+                    if not self.show_degrees.get():
+                        try:
+                            parsed[0] = math.radians(parsed[0])
+                        except Exception:
+                            pass
+                elif case_id == 2:
+                    # case 2 input is radians
+                    if self.show_degrees.get():
+                        try:
+                            parsed = [math.degrees(float(v)) for v in parsed]
+                        except Exception:
+                            parsed = [float(v) for v in parsed]
 
                 # For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
                 if case_id == 3 or case_id == 4:
@@ -903,6 +950,18 @@ class TCMPlotter(tk.Tk):
                 elif case_id == 4:
                     channels = channels + ["Mag magnitude (scaled)"]
 
+                # Adjust channel names for angle toggle in runtime (keeps PV labels consistent)
+                if case_id == 1:
+                    if self.show_degrees.get():
+                        channels[0] = "Heading (deg)"
+                    else:
+                        channels[0] = "Heading (rad)"
+                elif case_id == 2:
+                    if self.show_degrees.get():
+                        channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
+                    else:
+                        channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
+
                 # Ensure buffers exist and append values
                 for ch, val in zip(channels, parsed):
                     if ch not in self.buffers:
@@ -921,11 +980,28 @@ class TCMPlotter(tk.Tk):
                 channels = channels + ["Acc magnitude (scaled)"]
             elif case_id == 4:
                 channels = channels + ["Mag magnitude (scaled)"]
+            if case_id == 1:
+                if self.show_degrees.get():
+                    channels[0] = "Heading (deg)"
+                else:
+                    channels[0] = "Heading (rad)"
+            elif case_id == 2:
+                if self.show_degrees.get():
+                    channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
+                else:
+                    channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
+
             for ln, ch in zip(self.lines, channels):
-                ln.set_ydata(list(self.buffers[ch]))
+                try:
+                    ln.set_ydata(list(self.buffers[ch]))
+                except Exception:
+                    pass
             for ax in self.axes:
-                ax.relim()
-                ax.autoscale_view(scalex=False)
+                try:
+                    ax.relim()
+                    ax.autoscale_view(scalex=False)
+                except Exception:
+                    pass
             if last_parsed is not None:
                 self._update_pv(last_parsed)
 
@@ -982,6 +1058,18 @@ class TCMPlotter(tk.Tk):
             channels = channels + ["Acc magnitude (scaled)"]
         elif case_id == 4:
             channels = channels + ["Mag magnitude (scaled)"]
+        # respect angle toggle for static loads
+        if case_id == 1:
+            if self.show_degrees.get():
+                channels[0] = "Heading (deg)"
+            else:
+                channels[0] = "Heading (rad)"
+        elif case_id == 2:
+            if self.show_degrees.get():
+                channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
+            else:
+                channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
+
         data     = {ch: [] for ch in channels}
         skipped  = 0
 
@@ -998,14 +1086,27 @@ class TCMPlotter(tk.Tk):
                             skipped += 1
                             continue
                         try:
-                            parsed = meta["parse_bin"](payload)
-                            if case_id == 3 or case_id == 4:
+                            parsed = CASES[cid]["parse_bin"](payload)
+                            # angle conversion for static file
+                            if cid == 1 and not self.show_degrees.get():
+                                try:
+                                    parsed[0] = math.radians(parsed[0])
+                                except Exception:
+                                    pass
+                            if cid == 2 and self.show_degrees.get():
+                                try:
+                                    parsed = [math.degrees(float(v)) for v in parsed]
+                                except Exception:
+                                    parsed = [float(v) for v in parsed]
+
+                            if cid == 3 or cid == 4:
                                 try:
                                     sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
                                     mag = math.sqrt(sx*sx + sy*sy + sz*sz)
                                 except Exception:
                                     mag = 0.0
                                 parsed = list(parsed) + [mag]
+
                             for ch, val in zip(channels, parsed):
                                 data[ch].append(float(val))
                         except struct.error:
@@ -1021,14 +1122,27 @@ class TCMPlotter(tk.Tk):
                         skipped += 1
                         continue
                     try:
-                        parsed = meta["parse_text"](values)
-                        if case_id == 3 or case_id == 4:
+                        parsed = CASES[cid]["parse_text"](values)
+                        # angle conversion for static file
+                        if cid == 1 and not self.show_degrees.get():
+                            try:
+                                parsed[0] = math.radians(parsed[0])
+                            except Exception:
+                                pass
+                        if cid == 2 and self.show_degrees.get():
+                            try:
+                                parsed = [math.degrees(float(v)) for v in parsed]
+                            except Exception:
+                                parsed = [float(v) for v in parsed]
+
+                        if cid == 3 or cid == 4:
                             try:
                                 sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
                                 mag = math.sqrt(sx*sx + sy*sy + sz*sz)
                             except Exception:
                                 mag = 0.0
                             parsed = list(parsed) + [mag]
+
                         for ch, val in zip(channels, parsed):
                             data[ch].append(float(val))
                     except Exception:
@@ -1066,7 +1180,10 @@ class TCMPlotter(tk.Tk):
         self.running = False
         self.serial_stop.set()
         if self.anim:
-            self.anim.event_source.stop()
+            try:
+                self.anim.event_source.stop()
+            except Exception:
+                pass
             self.anim = None
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
@@ -1115,6 +1232,7 @@ class TCMPlotter(tk.Tk):
         finally:
             self._suppress_case_send = False
             self._pending_auto_case = None
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = TCMPlotter()
