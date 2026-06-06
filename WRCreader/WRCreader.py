@@ -376,6 +376,10 @@ class TCMPlotter(tk.Tk):
         # Show angles in degrees when True, radians when False
         self.show_degrees = tk.BooleanVar(value=True)
 
+        # Help window state
+        self.help_win = None
+        self.help_text = None
+
         # Track last message sent (display in main window) - must exist before building controls
         self.last_sent_var = tk.StringVar(value="")
 
@@ -469,6 +473,8 @@ class TCMPlotter(tk.Tk):
                    command=self._save_png).pack(side=tk.LEFT)
         ttk.Button(btn_frame, text="Raw...",
                    command=self._open_raw_window).pack(side=tk.LEFT, padx=(6, 0))
+        ttk.Button(btn_frame, text="Help...",
+                   command=self._open_help_window).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(btn_frame, text="Send...",
                    command=self._open_send_window).pack(side=tk.LEFT, padx=(6, 0))
 
@@ -599,6 +605,77 @@ class TCMPlotter(tk.Tk):
         )
         if path:
             self.file_path.set(path)
+
+    # ── Help window ───────────────────────────────────────────────────────────
+    def _open_help_window(self):
+        if self.help_win and tk.Toplevel.winfo_exists(self.help_win):
+            self.help_win.lift()
+            return
+
+        # Attempt to load README.md from script dir or repo root, fallback to embedded help
+        readme_text = None
+        try:
+            script_dir = Path(__file__).resolve().parent
+            candidates = [script_dir / "README.md", script_dir.parent / "README.md"]
+            for p in candidates:
+                if p.exists():
+                    try:
+                        readme_text = p.read_text(encoding="utf-8", errors="replace")
+                        break
+                    except Exception:
+                        readme_text = None
+        except Exception:
+            readme_text = None
+
+        if not readme_text:
+            readme_text = (
+                "TCM Data Plotter - Quick Help\n\n"
+                "• Source: Choose 'Serial' to read live from a serial port, or 'File' "
+                "to load a saved log.\n\n"
+                "• Auto-log: When reading from serial the tool auto-saves the incoming "
+                "stream to a file in your Downloads folder (tcm_YYYYMMDD_HHMMSS.csv/bin).\n\n"
+                "• Cases: The device sends numbered CASE frames. The plotter auto-detects "
+                "the active case and will auto-switch the displayed plot when new-case "
+                "frames arrive. You can also force a case via the Case dropdown; when "
+                "connected this will send the command [<case>] to the device and wait "
+                "for write confirmation before applying the change.\n\n"
+                "• Angle units: Toggle 'Degrees' to display heading/roll/pitch/yaw in "
+                "degrees. When off values are shown in radians.\n\n"
+                "• Raw: Open the Raw window to inspect the incoming ASCII or binary hex "
+                "messages.\n\n"
+                "• Send: Send arbitrary text to the device (append newline if desired).\n\n"
+                "• Save PNG: Save the current plot as a PNG image.\n\n"
+                "If a README.md file exists next to the script it will be shown here."
+            )
+
+        self.help_win = tk.Toplevel(self)
+        self.help_win.title("Help / README")
+        self.help_win.transient(self)
+        self.help_win.protocol("WM_DELETE_WINDOW", self._close_help_window)
+        frm = ttk.Frame(self.help_win, padding=6)
+        frm.pack(fill=tk.BOTH, expand=True)
+        self.help_text = scrolledtext.ScrolledText(frm, wrap=tk.WORD, state=tk.NORMAL, height=24)
+        try:
+            self.help_text.configure(background="#0f0f0f",
+                                     foreground="#e6e6e6",
+                                     insertbackground="#e6e6e6")
+        except Exception:
+            pass
+        self.help_text.pack(fill=tk.BOTH, expand=True)
+        try:
+            self.help_text.insert(tk.END, readme_text)
+            self.help_text.configure(state=tk.DISABLED)
+        except Exception:
+            pass
+
+    def _close_help_window(self):
+        if self.help_win:
+            try:
+                self.help_win.destroy()
+            except Exception:
+                pass
+        self.help_win = None
+        self.help_text = None
 
     # ── Present-value panel ────────────────────────────────────────────────────
     def _rebuild_pv_panel(self, channels):
