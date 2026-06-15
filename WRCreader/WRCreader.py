@@ -1,4 +1,12 @@
 ﻿"""
+
+ESP32
+Roll, pitch and yaw are stored and calculated in radians (fields rollRad, pitchRad, yawRad); 
+only headingDeg is in degrees (computed from yawRad in calcHeading()).
+
+
+
+
 tcm_plotter.py
 --------------
 Reads and plots TCM sensor data from either a live serial (RS-485/UART)
@@ -376,6 +384,9 @@ class TCMPlotter(tk.Tk):
         # Show angles in degrees when True, radians when False
         self.show_degrees = tk.BooleanVar(value=True)
 
+        # Range mode: "0_360" or "neg180_180"
+        self.range_mode = tk.StringVar(value="0_360")
+
         # Help window state
         self.help_win = None
         self.help_text = None
@@ -386,12 +397,16 @@ class TCMPlotter(tk.Tk):
         # Pending auto-switch case (scheduled from animation callback)
         self._pending_auto_case = None
 
+        # runtime-configurable window parameters (set at start)
+        self.start_sample = 0
+        self.window_size = WINDOW
+
         self._build_controls()
         self._refresh_ports()
 
-        # When True we suppress sending a case-change command to the device.
-        # Useful when the combobox is changed programmatically.
-        self._suppress_case_send = False
+        # Default to start at 0 and use a maximized window size (no startup prompts)
+        self.start_sample = 0
+        self.window_size = RAW_WIN_MAX_LINES
 
     # ── UI ─────────────────────────────────────────────────────────────────────
     def _build_controls(self):
@@ -419,13 +434,26 @@ class TCMPlotter(tk.Tk):
                         variable=self.show_degrees,
                         command=self._on_angle_toggle).grid(row=0, column=5, sticky=tk.W, padx=(8,0))
 
+        # Range mode controls (labels update when units change)
+        ttk.Label(ctrl, text="Range:").grid(row=0, column=6, sticky=tk.E, padx=(8,0))
+        # create radio buttons and keep references so we can update their text
+        self.range_rb0 = ttk.Radiobutton(ctrl, text="", variable=self.range_mode, value="0_360",
+                                         command=self._on_range_change)
+        self.range_rb0.grid(row=0, column=7, sticky=tk.W)
+        self.range_rb1 = ttk.Radiobutton(ctrl, text="", variable=self.range_mode, value="neg180_180",
+                                         command=self._on_range_change)
+        self.range_rb1.grid(row=0, column=8, sticky=tk.W)
+
+        # immediately set proper labels for range radios according to current unit
+        self._update_range_labels()
+
         # Last-sent indicator (main window)
-        ttk.Label(ctrl, text="Last Sent:").grid(row=0, column=6, sticky=tk.W)
-        ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=0, column=7, sticky=tk.W)
+        ttk.Label(ctrl, text="Last Sent:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
+        ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=1, column=1, columnspan=3, sticky=tk.W, pady=(6,0))
 
         # Port row
         self.port_frame = ttk.Frame(ctrl)
-        self.port_frame.grid(row=1, column=0, columnspan=8, sticky=tk.W, pady=2)
+        self.port_frame.grid(row=2, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.port_frame, text="Port:").pack(side=tk.LEFT)
         self.port_cb = ttk.Combobox(self.port_frame, textvariable=self.port_var, width=14)
         self.port_cb.pack(side=tk.LEFT, padx=4)
@@ -437,7 +465,7 @@ class TCMPlotter(tk.Tk):
 
         # File row (hidden initially)
         self.file_frame = ttk.Frame(ctrl)
-        self.file_frame.grid(row=2, column=0, columnspan=8, sticky=tk.W, pady=2)
+        self.file_frame.grid(row=3, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.file_frame, text="File:").pack(side=tk.LEFT)
         ttk.Entry(self.file_frame, textvariable=self.file_path, width=44
                   ).pack(side=tk.LEFT, padx=4)
@@ -447,23 +475,23 @@ class TCMPlotter(tk.Tk):
 
         # Auto-save log path display (serial mode only)
         self.logfile_frame = ttk.Frame(ctrl)
-        self.logfile_frame.grid(row=3, column=0, columnspan=8, sticky=tk.W, pady=2)
+        self.logfile_frame.grid(row=4, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.logfile_frame, text="Auto-log:").pack(side=tk.LEFT)
         ttk.Label(self.logfile_frame, textvariable=self.logfile_var,
                   foreground="#007700", font=("TkDefaultFont", 8)
                   ).pack(side=tk.LEFT, padx=4)
 
         # Case selector
-        ttk.Label(ctrl, text="Case:").grid(row=4, column=0, sticky=tk.W, pady=(6, 2))
+        ttk.Label(ctrl, text="Case:").grid(row=5, column=0, sticky=tk.W, pady=(6, 2))
         case_opts = [CASES[k]["label"] for k in sorted(CASES)]
         self.case_cb = ttk.Combobox(ctrl, values=case_opts, state="readonly", width=36)
         self.case_cb.current(0)
-        self.case_cb.grid(row=4, column=1, columnspan=5, sticky=tk.W, pady=(6, 2))
+        self.case_cb.grid(row=5, column=1, columnspan=5, sticky=tk.W, pady=(6, 2))
         self.case_cb.bind("<<ComboboxSelected>>", self._on_case_change)
 
         # Buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=5, column=0, columnspan=8, sticky=tk.W, pady=6)
+        btn_frame.grid(row=6, column=0, columnspan=9, sticky=tk.W, pady=6)
         self.start_btn = ttk.Button(btn_frame, text="Start", command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(btn_frame, text="Stop",
@@ -477,6 +505,24 @@ class TCMPlotter(tk.Tk):
                    command=self._open_help_window).pack(side=tk.LEFT, padx=(6, 0))
         ttk.Button(btn_frame, text="Send...",
                    command=self._open_send_window).pack(side=tk.LEFT, padx=(6, 0))
+
+    def _update_range_labels(self):
+        """Update the range radio button labels to match current unit selection."""
+        try:
+            if self.show_degrees.get():
+                self.range_rb0.config(text="0-360")
+                self.range_rb1.config(text="-180..180")
+            else:
+                # use unicode pi for clarity
+                self.range_rb0.config(text="0..2π")
+                self.range_rb1.config(text="-π..π")
+        except Exception:
+            pass
+
+    def _on_range_change(self):
+        self.status_var.set("Range: " + ("0-360" if self.range_mode.get() == "0_360" else "-180..180"))
+        if self.running:
+            self._rebuild_plot()
 
     def _refresh_ports(self):
         ports = [p.device for p in serial.tools.list_ports.comports()]
@@ -500,9 +546,12 @@ class TCMPlotter(tk.Tk):
         """
         Called when the Degrees checkbutton changes.
         Rebuild the plot so channel labels and units update immediately.
+        Also update the range radio labels to reflect the chosen unit.
         """
         val = self.show_degrees.get()
         self.status_var.set("Angle units: " + ("DEG" if val else "RAD"))
+        # update range radio labels immediately
+        self._update_range_labels()
         if self.running:
             # Rebuild plot to update labels and derived conversions
             self._rebuild_plot()
@@ -641,6 +690,7 @@ class TCMPlotter(tk.Tk):
                 "for write confirmation before applying the change.\n\n"
                 "• Angle units: Toggle 'Degrees' to display heading/roll/pitch/yaw in "
                 "degrees. When off values are shown in radians.\n\n"
+                "• Range selector: choose '0-360' or '-180..180' — applies to heading and to roll/pitch/yaw when shown as degrees (or the equivalent radian ranges).\n\n"
                 "• Raw: Open the Raw window to inspect the incoming ASCII or binary hex "
                 "messages.\n\n"
                 "• Send: Send arbitrary text to the device (append newline if desired).\n\n"
@@ -836,6 +886,25 @@ class TCMPlotter(tk.Tk):
             messagebox.showerror("Send failed",
                                  "Could not write to serial port.")
 
+    # ── Helpers for normalization ──────────────────────────────────────────────
+    def _deg_normalize(self, deg: float) -> float:
+        """Normalize degrees according to current range mode."""
+        if self.range_mode.get() == "0_360":
+            return deg % 360.0
+        return ((deg + 180.0) % 360.0) - 180.0
+
+    def _rad_normalize_from_deg(self, deg: float) -> float:
+        """Convert deg -> rad and normalize according to range mode."""
+        rad = math.radians(deg)
+        if self.range_mode.get() == "0_360":
+            return rad % (2.0 * math.pi)
+        return ((rad + math.pi) % (2.0 * math.pi)) - math.pi
+
+    def _deg_from_rad(self, rad: float) -> float:
+        """Convert rad -> deg and normalize according to range mode."""
+        deg = math.degrees(rad)
+        return self._deg_normalize(deg)
+
     # ── Plot builder ───────────────────────────────────────────────────────────
     def _rebuild_plot(self):
         # Stop and remove existing animation/figure safely
@@ -872,9 +941,9 @@ class TCMPlotter(tk.Tk):
 
         # add derived magnitude channel for case 3 and case 4
         if case_id == 3:
-            channels = channels + ["Acc magnitude (scaled)"]
+            channels = channels + ["Acc magnitude"]
         elif case_id == 4:
-            channels = channels + ["Mag magnitude (scaled)"]
+            channels = channels + ["Mag magnitude"]
 
         # Adjust angle channel labels when toggling rad/deg
         if case_id == 1:
@@ -887,8 +956,6 @@ class TCMPlotter(tk.Tk):
                 channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
             else:
                 channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
-            if case_id == 2 and (case_id == 3 or case_id == 4):
-                pass  # no-op, kept for style parity
 
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -896,9 +963,9 @@ class TCMPlotter(tk.Tk):
         # Rebuild present-value panel for new channel set
         self._rebuild_pv_panel(channels)
 
-        self.buffers = {ch: deque([0.0] * WINDOW, maxlen=WINDOW)
+        self.buffers = {ch: deque([0.0] * self.window_size, maxlen=self.window_size)
                         for ch in channels}
-        xs = list(range(WINDOW))
+        xs = list(range(self.start_sample, self.start_sample + self.window_size))
 
         self.fig, axes_raw = plt.subplots(n, 1,
                                            figsize=(10, max(3, 2 * n)),
@@ -916,6 +983,34 @@ class TCMPlotter(tk.Tk):
             ln, = ax.plot(xs, list(self.buffers[ch]),
                           color=colours[i % len(colours)], linewidth=1.2)
             self.lines.append(ln)
+
+            # Lock y-axis appropriately based on case and units
+            if case_id == 1:  # Heading
+                if self.show_degrees.get():
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0, 360)
+                    else:
+                        ax.set_ylim(-180, 180)
+                else:
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0.0, 2.0 * math.pi)
+                    else:
+                        ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis="y")
+            elif case_id == 2:  # Roll / Pitch / Yaw
+                if self.show_degrees.get():
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0, 360)
+                    else:
+                        ax.set_ylim(-180, 180)
+                else:
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0.0, 2.0 * math.pi)
+                    else:
+                        ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis="y")
+                # Add zero reference line for roll/pitch/yaw
+                ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
 
         self.axes[-1].set_xlabel("Sample", color="#cccccc", fontsize=8)
         self.fig.suptitle(meta["label"], color="white", fontsize=10)
@@ -993,19 +1088,36 @@ class TCMPlotter(tk.Tk):
                 else:
                     parsed = [float(v) for v in values]
 
-                # Angle unit convert for case 1 and 2 according to toggle:
+                # Angle unit convert & normalization:
                 if case_id == 1:
-                    # case 1 input is heading in degrees
-                    if not self.show_degrees.get():
+                    # Heading: input is degrees
+                    if self.show_degrees.get():
+                        # normalize degrees according to selected range
                         try:
-                            parsed[0] = math.radians(parsed[0])
+                            parsed[0] = self._deg_normalize(parsed[0])
+                        except Exception:
+                            pass
+                    else:
+                        # convert deg -> rad and.normalize according to range mode
+                        try:
+                            parsed[0] = self._rad_normalize_from_deg(parsed[0])
                         except Exception:
                             pass
                 elif case_id == 2:
-                    # case 2 input is radians
+                    # Roll/Pitch/Yaw: input is radians
                     if self.show_degrees.get():
+                        # convert rad -> deg and normalize per range
                         try:
-                            parsed = [math.degrees(float(v)) for v in parsed]
+                            parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
+                        except Exception:
+                            parsed = [float(v) for v in parsed]
+                    else:
+                        # keep radians, but normalize to selected radian range
+                        try:
+                            if self.range_mode.get() == "0_360":
+                                parsed = [float(v) % (2.0 * math.pi) for v in parsed]
+                            else:
+                                parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
                         except Exception:
                             parsed = [float(v) for v in parsed]
 
@@ -1042,7 +1154,7 @@ class TCMPlotter(tk.Tk):
                 # Ensure buffers exist and append values
                 for ch, val in zip(channels, parsed):
                     if ch not in self.buffers:
-                        self.buffers[ch] = deque([0.0] * WINDOW, maxlen=WINDOW)
+                        self.buffers[ch] = deque([0.0] * self.window_size, maxlen=self.window_size)
                     self.buffers[ch].append(val)
 
                 last_parsed = parsed
@@ -1068,15 +1180,22 @@ class TCMPlotter(tk.Tk):
                 else:
                     channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
 
+            # update plotted data; x coordinates are start_sample..start_sample+window_size-1
+            xs = list(range(self.start_sample, self.start_sample + self.window_size))
             for ln, ch in zip(self.lines, channels):
                 try:
+                    ln.set_xdata(xs)
                     ln.set_ydata(list(self.buffers[ch]))
                 except Exception:
                     pass
             for ax in self.axes:
                 try:
                     ax.relim()
-                    ax.autoscale_view(scalex=False)
+                    if case_id in (1, 2):
+                        # keep locked axes as configured in _rebuild_plot
+                        ax.autoscale_view(scalex=False, scaley=False)
+                    else:
+                        ax.autoscale_view(scalex=False)
                 except Exception:
                     pass
             if last_parsed is not None:
@@ -1164,17 +1283,17 @@ class TCMPlotter(tk.Tk):
                             continue
                         try:
                             parsed = CASES[cid]["parse_bin"](payload)
-                            # angle conversion for static file
-                            if cid == 1 and not self.show_degrees.get():
-                                try:
-                                    parsed[0] = math.radians(parsed[0])
-                                except Exception:
-                                    pass
-                            if cid == 2 and self.show_degrees.get():
-                                try:
-                                    parsed = [math.degrees(float(v)) for v in parsed]
-                                except Exception:
-                                    parsed = [float(v) for v in parsed]
+                            # angle conversion & normalization for static file
+                            if cid == 1:
+                                if self.show_degrees.get():
+                                    parsed[0] = self._deg_normalize(parsed[0])
+                                else:
+                                    parsed[0] = self._rad_normalize_from_deg(parsed[0])
+                            if cid == 2:
+                                if self.show_degrees.get():
+                                    parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
+                                else:
+                                    parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
 
                             if cid == 3 or cid == 4:
                                 try:
@@ -1200,17 +1319,17 @@ class TCMPlotter(tk.Tk):
                         continue
                     try:
                         parsed = CASES[cid]["parse_text"](values)
-                        # angle conversion for static file
-                        if cid == 1 and not self.show_degrees.get():
-                            try:
-                                parsed[0] = math.radians(parsed[0])
-                            except Exception:
-                                pass
-                        if cid == 2 and self.show_degrees.get():
-                            try:
-                                parsed = [math.degrees(float(v)) for v in parsed]
-                            except Exception:
-                                parsed = [float(v) for v in parsed]
+                        # angle conversion & normalization for static file
+                        if cid == 1:
+                            if self.show_degrees.get():
+                                parsed[0] = self._deg_normalize(parsed[0])
+                            else:
+                                parsed[0] = self._rad_normalize_from_deg(parsed[0])
+                        if cid == 2:
+                            if self.show_degrees.get():
+                                parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
+                            else:
+                                parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
 
                         if cid == 3 or cid == 4:
                             try:
@@ -1240,6 +1359,32 @@ class TCMPlotter(tk.Tk):
             ax.set_xlim(0, n_samples - 1)
             ax.relim()
             ax.autoscale_view()
+            # Ensure axes remain consistent with selected mode
+            if case_id == 1:
+                if self.show_degrees.get():
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0, 360)
+                    else:
+                        ax.set_ylim(-180, 180)
+                else:
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0.0, 2.0 * math.pi)
+                    else:
+                        ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis='y')
+            elif case_id == 2:
+                if self.show_degrees.get():
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0, 360)
+                    else:
+                        ax.set_ylim(-180, 180)
+                else:
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0.0, 2.0 * math.pi)
+                    else:
+                        ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis='y')
+                ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
 
         self.canvas_widget.draw()
 
