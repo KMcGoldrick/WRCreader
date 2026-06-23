@@ -123,7 +123,13 @@ CASES = {
                                  int(v[2]),   float(v[3])],
         "parse_bin":  lambda p: list(struct.unpack_from("<HfHf", p)),
     },
-}
+    12: {
+        "label":      "12 - Tilt + Speed",
+        "channels":   ["Tilt (rad)", "Speed (m/s)"],
+        "parse_text": lambda v: [float(v[0]), float(v[1])],
+        "parse_bin":  lambda p: list(struct.unpack_from("<ff", p)),
+    },
+    }
 
 NON_PLOT_CASES = {6, 7, 8, 9, 10, 11}
 
@@ -145,7 +151,7 @@ class FormatDetector:
 
     def _decide(self):
         for i in range(len(self._buf) - 1):
-            if self._buf[i] == TCM_BIN_SOF and self._buf[i + 1] in range(12):
+            if self._buf[i] == TCM_BIN_SOF and self._buf[i + 1] in range(13):
                 self.format = "binary"
                 return
         self.format = "text"
@@ -973,6 +979,11 @@ class TCMPlotter(tk.Tk):
             else:
                 channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
 
+        elif case_id == 12:
+            if self.show_degrees.get():
+                channels[0] = "Tilt (deg)"
+            else:
+                channels[0] = "Tilt (rad)"        
         n        = len(channels)
         colours  = plt.rcParams["axes.prop_cycle"].by_key()["color"]
 
@@ -1133,17 +1144,23 @@ class TCMPlotter(tk.Tk):
                             parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
                         except Exception:
                             parsed = [float(v) for v in parsed]
-                    else:
-                        # keep radians, but normalize to selected radian range
+                elif case_id == 12:
+                    if self.show_degrees.get():
                         try:
-                            if self.range_mode.get() == "0_360":
-                                parsed = [float(v) % (2.0 * math.pi) for v in parsed]
-                            else:
-                                parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
+                            parsed[0] = math.degrees(parsed[0])
                         except Exception:
-                            parsed = [float(v) for v in parsed]
+                            pass
+                else:
+                    # keep radians, but normalize to selected radian range
+                    try:
+                        if self.range_mode.get() == "0_360":
+                            parsed = [float(v) % (2.0 * math.pi) for v in parsed]
+                        else:
+                            parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
+                    except Exception:
+                        parsed = [float(v) for v in parsed]
 
-                # For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
+# For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
                 if case_id == 3 or case_id == 4:
                     try:
                         sx = float(parsed[3])
@@ -1212,7 +1229,11 @@ class TCMPlotter(tk.Tk):
                     channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
                 else:
                     channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
-
+            elif case_id == 12:
+                if self.show_degrees.get():
+                    channels[0] = "Tilt (deg)"
+                else:
+                    channels[0] = "Tilt (rad)"
             # update plotted data; x coordinates come from time_buffer
             xs = list(self.time_buffer)
             for ln, ch in zip(self.lines, channels):
@@ -1312,7 +1333,11 @@ class TCMPlotter(tk.Tk):
                 channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
             else:
                 channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
-
+        elif case_id == 12:
+            if self.show_degrees.get():
+                channels[0] = "Tilt (deg)"
+            else:
+                channels[0] = "Tilt (rad)"
         data     = {ch: [] for ch in channels}
         skipped  = 0
 
@@ -1345,6 +1370,12 @@ class TCMPlotter(tk.Tk):
                                     else:
                                         parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
 
+                            if cid == 12:
+                                if self.show_degrees.get():
+                                    try:
+                                        parsed[0] = math.degrees(parsed[0])
+                                    except Exception:
+                                        pass
                             if cid == 3 or cid == 4:
                                 try:
                                     sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
@@ -1391,13 +1422,22 @@ class TCMPlotter(tk.Tk):
                             except Exception:
                                 mag = 0.0
                             parsed = list(parsed) + [mag]
+                        
+                        if cid == 12:
+                                if self.show_degrees.get():
+                                    try:
+                                        parsed[0] = math.degrees(parsed[0])
+                                    except Exception:
+                                        pass
 
                         for ch, val in zip(channels, parsed):
                             data[ch].append(float(val))
-                    except Exception:
+
+                    except (ValueError, struct.error):
                         pass
 
         n_samples = len(data[channels[0]]) if channels else 0
+        
         if n_samples == 0:
             messagebox.showwarning(
                 "No data",
