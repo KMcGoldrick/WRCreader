@@ -620,7 +620,7 @@ class TCMPlotter(tk.Tk):
         # Background sender thread: perform write_text and marshal result back to UI thread.
         def _send_case_and_apply(case_to_send, prev):
             # Use square-bracket command format as requested
-            cmd = f"[{case_to_send}]\n"
+            cmd = f"[{case_to_send}\n"
             ok = False
             try:
                 ok = self.serial_thread.write_text(cmd)
@@ -1369,7 +1369,6 @@ class TCMPlotter(tk.Tk):
                                         parsed = [float(v) % (2.0 * math.pi) for v in parsed]
                                     else:
                                         parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
-
                             if cid == 12:
                                 if self.show_degrees.get():
                                     try:
