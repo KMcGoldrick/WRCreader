@@ -792,6 +792,22 @@ class TCMPlotter(tk.Tk):
             return
         self.raw_win = tk.Toplevel(self)
         self.raw_win.title("Raw Data")
+
+        # Desired window size
+        w = 800
+        h = 400
+
+        # Get screen dimensions
+        screen_w = self.raw_win.winfo_screenwidth()
+        screen_h = self.raw_win.winfo_screenheight()
+
+        # Leave a small margin from the edges
+        margin = 100
+
+        x = screen_w - w - margin
+        y = screen_h - h - margin
+
+        self.raw_win.geometry(f"{w}x{h}+{x}+{y}")
         self.raw_win.protocol("WM_DELETE_WINDOW", self._close_raw_window)
         frm = ttk.Frame(self.raw_win, padding=6)
         frm.pack(fill=tk.BOTH, expand=True)
@@ -1279,6 +1295,7 @@ class TCMPlotter(tk.Tk):
         # reset time tracking on start
         self.start_time = None
         self._rebuild_plot()
+        self._open_raw_window()
 
         if self.source_var.get() == "serial":
             self._start_serial()
@@ -1503,6 +1520,7 @@ class TCMPlotter(tk.Tk):
             self.anim = None
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
+        self._close_raw_window()
         if not keep_plot:
             self.status_var.set("Stopped.")
 
