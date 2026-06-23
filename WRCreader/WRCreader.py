@@ -35,6 +35,8 @@ what "Read From Log File" can read back.
 Usage:
   pip install pyserial matplotlib
   python tcm_plotter.py
+
+  pyinstaller your_program.py
 """
 
 import math
