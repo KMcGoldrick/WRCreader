@@ -40,6 +40,7 @@ Usage:
 """
 
 import math
+import time
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import tkinter.scrolledtext as scrolledtext
@@ -65,6 +66,13 @@ BAUDRATE         = 115200
 INTERVAL         = 50           # animation refresh ms
 TCM_BIN_SOF      = 0xAA
 RAW_WIN_MAX_LINES = 2000
+
+# X axis speed multiplier: 2 => x coordinates progress twice as fast
+X_SPEED = 8
+
+# When converting file samples (no timestamps) to elapsed seconds, use this dt (s/sample).
+# INTERVAL is the animation interval, not sample rate; use it as a reasonable default.
+DEFAULT_SAMPLE_DT = INTERVAL / 1000.0
 
 # LOG_DIR: prefer the user's Downloads folder, fall back to script directory
 try:
@@ -402,6 +410,12 @@ class TCMPlotter(tk.Tk):
         # runtime-configurable window parameters (set at start)
         self.start_sample = 0
         self.window_size = WINDOW
+        # x axis speed multiplier (1 = normal, 2 = twice as fast)
+        self.x_speed = X_SPEED
+
+        # time tracking for real-time x-axis
+        self.start_time = None
+        self.time_buffer = None  # will be initialized in _rebuild_plot
 
         self._build_controls()
         self._refresh_ports()
@@ -965,9 +979,15 @@ class TCMPlotter(tk.Tk):
         # Rebuild present-value panel for new channel set
         self._rebuild_pv_panel(channels)
 
+        # reset buffers and time buffer
         self.buffers = {ch: deque([0.0] * self.window_size, maxlen=self.window_size)
                         for ch in channels}
-        xs = list(range(self.start_sample, self.start_sample + self.window_size))
+        self.time_buffer = deque([0.0] * self.window_size, maxlen=self.window_size)
+        # reset start time when rebuilding plot (live capture will set start_time on first sample)
+        self.start_time = None
+
+        # x coordinates come from time_buffer (seconds elapsed)
+        xs = list(self.time_buffer)
 
         self.fig, axes_raw = plt.subplots(n, 1,
                                            figsize=(10, max(3, 2 * n)),
@@ -1014,7 +1034,7 @@ class TCMPlotter(tk.Tk):
                 # Add zero reference line for roll/pitch/yaw
                 ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
 
-        self.axes[-1].set_xlabel("Sample", color="#cccccc", fontsize=8)
+        self.axes[-1].set_xlabel("Time (s)", color="#cccccc", fontsize=8)
         self.fig.suptitle(meta["label"], color="white", fontsize=10)
 
         canvas = FigureCanvasTkAgg(self.fig, master=self.plot_frame)
@@ -1134,6 +1154,12 @@ class TCMPlotter(tk.Tk):
                         mag = 0.0
                     parsed = list(parsed) + [mag]
 
+                # timestamp this sample (monotonic elapsed seconds)
+                now = time.monotonic()
+                if self.start_time is None:
+                    self.start_time = now
+                elapsed = (now - self.start_time) * float(self.x_speed)
+
                 # Determine channels list including derived channel for case 3 or 4
                 channels = list(meta["channels"])
                 if case_id == 3:
@@ -1159,6 +1185,11 @@ class TCMPlotter(tk.Tk):
                         self.buffers[ch] = deque([0.0] * self.window_size, maxlen=self.window_size)
                     self.buffers[ch].append(val)
 
+                # append timestamp for this sample
+                if self.time_buffer is None:
+                    self.time_buffer = deque([0.0] * self.window_size, maxlen=self.window_size)
+                self.time_buffer.append(elapsed)
+
                 last_parsed = parsed
                 updated = True
             except Exception:
@@ -1182,24 +1213,36 @@ class TCMPlotter(tk.Tk):
                 else:
                     channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
 
-            # update plotted data; x coordinates are start_sample..start_sample+window_size-1
-            xs = list(range(self.start_sample, self.start_sample + self.window_size))
+            # update plotted data; x coordinates come from time_buffer
+            xs = list(self.time_buffer)
             for ln, ch in zip(self.lines, channels):
                 try:
                     ln.set_xdata(xs)
                     ln.set_ydata(list(self.buffers[ch]))
                 except Exception:
                     pass
-            for ax in self.axes:
-                try:
-                    ax.relim()
-                    if case_id in (1, 2):
-                        # keep locked axes as configured in _rebuild_plot
-                        ax.autoscale_view(scalex=False, scaley=False)
-                    else:
-                        ax.autoscale_view(scalex=False)
-                except Exception:
-                    pass
+
+            # Explicitly update x-limits so the plot window follows time_buffer
+            if xs:
+                for ax in self.axes:
+                    try:
+                        ax.set_xlim(xs[0], xs[-1])
+                        ax.relim()
+                        if case_id in (1, 2):
+                            # keep locked y-axis as before
+                            ax.autoscale_view(scalex=False, scaley=False)
+                        else:
+                            ax.autoscale_view(scalex=False)
+                    except Exception:
+                        pass
+
+            # Force canvas redraw (use draw_idle to be cooperative with GUI)
+            try:
+                if self.canvas_widget:
+                    self.canvas_widget.draw_idle()
+            except Exception:
+                pass
+
             if last_parsed is not None:
                 self._update_pv(last_parsed)
 
@@ -1212,6 +1255,8 @@ class TCMPlotter(tk.Tk):
         self.logfile_var.set("")
         self.start_btn.config(state=tk.DISABLED)
         self.stop_btn.config(state=tk.NORMAL)
+        # reset time tracking on start
+        self.start_time = None
         self._rebuild_plot()
 
         if self.source_var.get() == "serial":
@@ -1295,7 +1340,10 @@ class TCMPlotter(tk.Tk):
                                 if self.show_degrees.get():
                                     parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
                                 else:
-                                    parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
+                                    if self.range_mode.get() == "0_360":
+                                        parsed = [float(v) % (2.0 * math.pi) for v in parsed]
+                                    else:
+                                        parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
 
                             if cid == 3 or cid == 4:
                                 try:
@@ -1331,7 +1379,10 @@ class TCMPlotter(tk.Tk):
                             if self.show_degrees.get():
                                 parsed = [self._deg_normalize(math.degrees(float(v))) for v in parsed]
                             else:
-                                parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
+                                if self.range_mode.get() == "0_360":
+                                    parsed = [float(v) % (2.0 * math.pi) for v in parsed]
+                                else:
+                                    parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
 
                         if cid == 3 or cid == 4:
                             try:
@@ -1354,11 +1405,13 @@ class TCMPlotter(tk.Tk):
             self._stop()
             return
 
-        xs = list(range(n_samples))
+        # For static file loads we don't have real timestamps; synthesize them using DEFAULT_SAMPLE_DT
+        sample_dt = DEFAULT_SAMPLE_DT
+        xs = [ (i * sample_dt * float(self.x_speed)) for i in range(n_samples) ]
         for ax, ln, ch in zip(self.axes, self.lines, channels):
             ln.set_xdata(xs)
             ln.set_ydata(data[ch])
-            ax.set_xlim(0, n_samples - 1)
+            ax.set_xlim(xs[0], xs[-1] if xs else 0.0)
             ax.relim()
             ax.autoscale_view()
             # Ensure axes remain consistent with selected mode
