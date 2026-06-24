@@ -364,3 +364,4 @@ FodyWeavers.xsd
 /WRCreader/build/WRCreader
 /WRCreader/dist/WRCreader
 *.spec
+/WRCreader/WRCreader/_internal
