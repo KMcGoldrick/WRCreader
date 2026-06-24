@@ -409,6 +409,8 @@ class TCMPlotter(tk.Tk):
 
         # Track last message sent (display in main window) - must exist before building controls
         self.last_sent_var = tk.StringVar(value="")
+        self.last_parsed_var = tk.StringVar(value="")
+        self.last_received_var = tk.StringVar(value="")
 
         # Pending auto-switch case (scheduled from animation callback)
         self._pending_auto_case = None
@@ -473,9 +475,15 @@ class TCMPlotter(tk.Tk):
         ttk.Label(ctrl, text="Last Sent:").grid(row=1, column=0, sticky=tk.W, pady=(6,0))
         ttk.Label(ctrl, textvariable=self.last_sent_var).grid(row=1, column=1, columnspan=3, sticky=tk.W, pady=(6,0))
 
+        ttk.Label(ctrl, text="Last Received:").grid(row=2, column=0, sticky=tk.W, pady=(2,0))
+        ttk.Label(ctrl,textvariable=self.last_received_var).grid(row=2, column=1,columnspan=8,sticky=tk.W,pady=(2,0))
+
+        ttk.Label(ctrl, text="Last Parsed:").grid(row=3, column=0, sticky=tk.W, pady=(2,0))
+        ttk.Label(ctrl,textvariable=self.last_parsed_var).grid(row=3, column=1,columnspan=8,sticky=tk.W,pady=(2,0))
+
         # Port row
         self.port_frame = ttk.Frame(ctrl)
-        self.port_frame.grid(row=2, column=0, columnspan=9, sticky=tk.W, pady=2)
+        self.port_frame.grid(row=4, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.port_frame, text="Port:").pack(side=tk.LEFT)
         self.port_cb = ttk.Combobox(self.port_frame, textvariable=self.port_var, width=14)
         self.port_cb.pack(side=tk.LEFT, padx=4)
@@ -487,7 +495,7 @@ class TCMPlotter(tk.Tk):
 
         # File row (hidden initially)
         self.file_frame = ttk.Frame(ctrl)
-        self.file_frame.grid(row=3, column=0, columnspan=9, sticky=tk.W, pady=2)
+        self.file_frame.grid(row=5, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.file_frame, text="File:").pack(side=tk.LEFT)
         ttk.Entry(self.file_frame, textvariable=self.file_path, width=44
                   ).pack(side=tk.LEFT, padx=4)
@@ -497,7 +505,7 @@ class TCMPlotter(tk.Tk):
 
         # Auto-save log path display (serial mode only)
         self.logfile_frame = ttk.Frame(ctrl)
-        self.logfile_frame.grid(row=4, column=0, columnspan=9, sticky=tk.W, pady=2)
+        self.logfile_frame.grid(row=6, column=0, columnspan=9, sticky=tk.W, pady=2)
         ttk.Label(self.logfile_frame, text="Auto-log:").pack(side=tk.LEFT)
         ttk.Label(self.logfile_frame, textvariable=self.logfile_var,
                   foreground="#007700", font=("TkDefaultFont", 8)
@@ -508,12 +516,12 @@ class TCMPlotter(tk.Tk):
         case_opts = [CASES[k]["label"] for k in sorted(CASES)]
         self.case_cb = ttk.Combobox(ctrl, values=case_opts, state="readonly", width=36)
         self.case_cb.current(0)
-        self.case_cb.grid(row=5, column=1, columnspan=5, sticky=tk.W, pady=(6, 2))
+        self.case_cb.grid(row=7, column=1, columnspan=5, sticky=tk.W, pady=(6, 2))
         self.case_cb.bind("<<ComboboxSelected>>", self._on_case_change)
 
         # Buttons
         btn_frame = ttk.Frame(ctrl)
-        btn_frame.grid(row=6, column=0, columnspan=9, sticky=tk.W, pady=6)
+        btn_frame.grid(row=8, column=0, columnspan=9, sticky=tk.W, pady=6)
         self.start_btn = ttk.Button(btn_frame, text="Start", command=self._start)
         self.start_btn.pack(side=tk.LEFT, padx=(0, 6))
         self.stop_btn = ttk.Button(btn_frame, text="Stop",
@@ -777,6 +785,7 @@ class TCMPlotter(tk.Tk):
 
     def _update_pv(self, parsed):
         """Update present-value StringVars with the latest sample."""
+        print("PV INPUT:", parsed)
         if parsed is None:
             return
         for sv, val in zip(self.pv_labels, parsed):
@@ -1101,9 +1110,15 @@ class TCMPlotter(tk.Tk):
                 continue
 
             if item[0] == "RAW":
-                self._append_raw_line(item[1])
-                continue
+                line = item[1].strip()
 
+                if not line:   # <-- KEY FIX
+                    continue
+
+                self._append_raw_line(line)
+                self.last_received_var.set(f"Received: {line}")
+                continue
+        
             if item[0] == "LOGFILE":
                 self.logfile_var.set(os.path.basename(item[1]))
                 continue
@@ -1167,16 +1182,9 @@ class TCMPlotter(tk.Tk):
                         except Exception:
                             pass
                 else:
-                    # keep radians, but normalize to selected radian range
-                    try:
-                        if self.range_mode.get() == "0_360":
-                            parsed = [float(v) % (2.0 * math.pi) for v in parsed]
-                        else:
-                            parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
-                    except Exception:
-                        parsed = [float(v) for v in parsed]
-
-# For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
+                    parsed = [float(v) for v in parsed]
+                
+                # For case 3 and case 4 compute derived magnitude from scaled values (indices 3,4,5)
                 if case_id == 3 or case_id == 4:
                     try:
                         sx = float(parsed[3])
@@ -1281,7 +1289,14 @@ class TCMPlotter(tk.Tk):
                 pass
 
             if last_parsed is not None:
+                print("CID:", cid)
+                print("RAW VALUES:", values)
+                print("PARSED:", parsed if 'parsed' in locals() else None)             
                 self._update_pv(last_parsed)
+                self.last_parsed_var.set(
+                    ", ".join(f"{v:.4f}" if isinstance(v, float) else str(v)
+                    for v in last_parsed)
+)
 
         return self.lines
 
@@ -1520,7 +1535,6 @@ class TCMPlotter(tk.Tk):
             self.anim = None
         self.start_btn.config(state=tk.NORMAL)
         self.stop_btn.config(state=tk.DISABLED)
-        self._close_raw_window()
         if not keep_plot:
             self.status_var.set("Stopped.")
 
