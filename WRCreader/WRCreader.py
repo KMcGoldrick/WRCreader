@@ -1003,7 +1003,6 @@ class TCMPlotter(tk.Tk):
                 channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
             else:
                 channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
-
         elif case_id == 12:
             if self.show_degrees.get():
                 channels[0] = "Tilt (deg)"
@@ -1069,6 +1068,21 @@ class TCMPlotter(tk.Tk):
                 ax.autoscale(enable=False, axis="y")
                 # Add zero reference line for roll/pitch/yaw
                 ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
+            elif case_id == 12 and i == 0:  # Tilt
+                if self.show_degrees.get():
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0, 360)
+                    else:
+                        ax.set_ylim(-180, 180)
+                else:
+                    if self.range_mode.get() == "0_360":
+                        ax.set_ylim(0.0, 2.0 * math.pi)
+                    else:
+                        ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis="y")
+                # Add zero reference line for Tilt
+                ax.axhline(0.0, color="#888888", linewidth=0.9, linestyle="--")
+
 
         self.axes[-1].set_xlabel("Time (s)", color="#cccccc", fontsize=8)
         self.fig.suptitle(meta["label"], color="white", fontsize=10)
@@ -1176,11 +1190,13 @@ class TCMPlotter(tk.Tk):
                         except Exception:
                             parsed = [float(v) for v in parsed]
                 elif case_id == 12:
+                    # Tilt: input is radians
                     if self.show_degrees.get():
+                        # convert rad -> deg and normalize per range
                         try:
-                            parsed[0] = math.degrees(parsed[0])
+                            parsed[0] = self._deg_normalize(math.degrees(float(parsed[0])))
                         except Exception:
-                            pass
+                            parsed[0] = float(parsed[0])
                 else:
                     parsed = [float(v) for v in parsed]
                 
@@ -1403,10 +1419,13 @@ class TCMPlotter(tk.Tk):
                                         parsed = [((float(v) + math.pi) % (2.0 * math.pi)) - math.pi for v in parsed]
                             if cid == 12:
                                 if self.show_degrees.get():
-                                    try:
-                                        parsed[0] = math.degrees(parsed[0])
-                                    except Exception:
-                                        pass
+                                    parsed[0] = self._deg_normalize(math.degrees(float(parsed[0])))
+                                else:
+                                    if self.range_mode.get() == "0_360":
+                                        parsed[0] = float(parsed[0]) % (2.0 * math.pi)
+                                    else:
+                                        parsed[0] = ((float(parsed[0]) + math.pi) % (2.0 * math.pi)) - math.pi
+
                             if cid == 3 or cid == 4:
                                 try:
                                     sx, sy, sz = float(parsed[3]), float(parsed[4]), float(parsed[5])
@@ -1455,11 +1474,13 @@ class TCMPlotter(tk.Tk):
                             parsed = list(parsed) + [mag]
                         
                         if cid == 12:
-                                if self.show_degrees.get():
-                                    try:
-                                        parsed[0] = math.degrees(parsed[0])
-                                    except Exception:
-                                        pass
+                            if self.show_degrees.get():
+                                parsed[0] = self._deg_normalize(math.degrees(float(parsed[0])))
+                            else:
+                                if self.range_mode.get() == "0_360":
+                                    parsed[0] = float(parsed[0]) % (2.0 * math.pi)
+                                else:
+                                    parsed[0] = ((float(parsed[0]) + math.pi) % (2.0 * math.pi)) - math.pi
 
                         for ch, val in zip(channels, parsed):
                             data[ch].append(float(val))
