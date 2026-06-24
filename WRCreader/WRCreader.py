@@ -22,6 +22,7 @@ Supported cases (plottable)
   3  - Accel raw (int16 x3) + scaled (float x3)
   4  - Mag   raw (int16 x3) + scaled (float x3)
   5  - Temp  raw + scaled,  Batt raw + scaled
+  12 - Tilt (rad) + Speed (m/s)
 
 Cases 6-11 are calibration/config: logged to status bar, not plotted.
 
@@ -1042,7 +1043,7 @@ class TCMPlotter(tk.Tk):
             self.lines.append(ln)
 
             # Lock y-axis appropriately based on case and units
-            if case_id == 1:  # Heading
+            if case_id == 1 and i == 0:  # Heading
                 if self.show_degrees.get():
                     if self.range_mode.get() == "0_360":
                         ax.set_ylim(0, 360)
@@ -1053,6 +1054,9 @@ class TCMPlotter(tk.Tk):
                         ax.set_ylim(0.0, 2.0 * math.pi)
                     else:
                         ax.set_ylim(-math.pi, math.pi)
+                ax.autoscale(enable=False, axis="y")
+            elif case_id == 1 and (i == 1 or i ==2): 
+                ax.set_ylim(-3.0,3.0)
                 ax.autoscale(enable=False, axis="y")
             elif case_id == 2:  # Roll / Pitch / Yaw
                 if self.show_degrees.get():
@@ -1235,6 +1239,11 @@ class TCMPlotter(tk.Tk):
                         channels = ["Roll (deg)", "Pitch (deg)", "Yaw (deg)"]
                     else:
                         channels = ["Roll (rad)", "Pitch (rad)", "Yaw (rad)"]
+                elif case_id == 12:
+                    if self.show_degrees.get():
+                        channels[0] = "Tilt (deg)"
+                    else:
+                        channels[0] = "Tilt (rad)"
 
                 # Ensure buffers exist and append values
                 for ch, val in zip(channels, parsed):
